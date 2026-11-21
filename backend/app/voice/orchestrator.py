@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from app.compliance.opening import render_opening
+from app.llm.prompt import render_intent_prompt, sample_for_attempt
 from app.compliance.redline import review_assistant_text
 from app.voice.asr import MockAsr, VendorRejected, decode_pcm
 from app.voice.circuit import CircuitPort, VendorCircuit
@@ -68,6 +69,7 @@ class Outcome:
     demand_stop: bool = False
     script_tree: bool = False
     guard_timeout: bool = False
+    llm_temperatures: list[float] = field(default_factory=list)
 
 
 def strip_injection(text: str) -> str:
@@ -178,6 +180,18 @@ def _silence_episodes(silence_ms: int, timeout_ms: int, silent: bool) -> int:
     if timeout_ms <= 0:
         return 1
     return silence_ms // timeout_ms
+
+
+def _open_node(script: list[dict[str, object]] | None) -> str:
+    for item in script or []:
+        key = item.get("node_key") or item.get("id")
+        if key == "n_open" and isinstance(key, str):
+            return key
+    for item in script or []:
+        key = item.get("node_key") or item.get("id")
+        if isinstance(key, str) and key:
+            return key
+    return "n_open"
 
 
 def caller_frames(heard: str, script: list[dict[str, object]] | None) -> list[Frame]:
@@ -321,6 +335,7 @@ async def run_session(
     ask_human = False
     demand_stop = False
     script_tree = False
+    llm_temperatures: list[float] = []
     if no_input or hold:
         intent = "invalid"
     elif llm_down:
@@ -329,7 +344,10 @@ async def run_session(
     else:
         parsed: dict[str, object] | None = None
         vendor_failures = 0
-        for raw in _payloads(llm_mode, heard):
+        node_id = _open_node(script)
+        render_intent_prompt(last_user_text=heard, node_id=node_id, asr_confidence="", history=[])
+        for index, raw in enumerate(_payloads(llm_mode, heard)[:2]):
+            llm_temperatures.append(sample_for_attempt(index).temperature)
             if raw is None:
                 vendor_failures += 1
                 llm_circuit.observe(503)
@@ -456,4 +474,5 @@ async def run_session(
         demand_stop=demand_stop,
         script_tree=script_tree,
         guard_timeout=guard_timeout,
+        llm_temperatures=llm_temperatures,
     )

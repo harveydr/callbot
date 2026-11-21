@@ -132,6 +132,9 @@ async def test_broken_model_json_retries_once_then_asks_again() -> None:
     assert "再确认一下" not in recovered.reply_text
     assert bare.intent == "agree"
     assert bare.intent_confidence == 0.5
+    assert broken.llm_temperatures == [0.3, 0.0]
+    assert recovered.llm_temperatures == [0.3, 0.0]
+    assert bare.llm_temperatures == [0.3]
 
 
 async def test_bad_json_and_prompt_injection_do_not_skip_the_opening() -> None:
@@ -878,5 +881,10 @@ async def test_a_format_error_is_stored_on_the_call(
         spoken = await session.scalar(select(CallTurn.text_content).where(CallTurn.speaker == "assistant"))
     assert started == 1
     assert call is not None and call.intent_grade == "C"
-    assert event is not None and event.detail == {"retried": True}
+    assert event is not None and event.detail == {
+        "retried": True,
+        "temperatures": [0.3, 0.0],
+        "top_p": 0.8,
+        "max_tokens": 150,
+    }
     assert spoken is not None and "再确认一下" in spoken and opening_is_complete(spoken)

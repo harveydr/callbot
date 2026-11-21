@@ -12,6 +12,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.compliance.cache import load_template_script, remember_dnd
+from app.llm.prompt import FIRST_SAMPLE
 from app.compliance.gate_pre import CampaignView, Flags, TenantView, TrunkView, pre_dial_gate
 from app.compliance.qualification import apply_qualification_clock
 from app.compliance.guard_incall import on_caller_text
@@ -696,7 +697,12 @@ async def _place(
                 tenant_id=campaign.tenant_id,
                 call_id=call.id,
                 event_type="llm_format_error",
-                detail={"retried": True},
+                detail={
+                    "retried": True,
+                    "temperatures": outcome.llm_temperatures,
+                    "top_p": FIRST_SAMPLE.top_p,
+                    "max_tokens": FIRST_SAMPLE.max_tokens,
+                },
             )
         )
     rate = await session.scalar(
