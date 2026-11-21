@@ -4,8 +4,14 @@
     <el-button v-if="canExport" type="primary" @click="exportReport">导出明细</el-button>
     <el-alert v-if="exportNote" :title="exportNote" type="success" show-icon :closable="false" style="margin: 12px 0" />
     <StateView :status="status" :message="message" :stale="stale" @retry="load(0)">
-      <el-table :data="items" style="width: 100%">
-        <el-table-column v-for="column in columns" :key="column" :prop="column" :label="column" />
+      <div v-if="overview && items[0]" class="metrics">
+        <div v-for="column in columns" :key="column" class="metric">
+          <span>{{ labelOf(column) }}</span>
+          <strong>{{ formatCell(column, items[0][column]) }}</strong>
+        </div>
+      </div>
+      <el-table v-else :data="items" style="width: 100%">
+        <el-table-column v-for="column in columns" :key="column" :prop="column" :label="labelOf(column)" />
       </el-table>
     </StateView>
   </div>
@@ -28,7 +34,40 @@ const stale = ref("");
 const items = ref([]);
 const title = computed(() => route.meta.title || "列表");
 const canExport = computed(() => route.path === "/t/reports" && session.role === "tenant_admin");
+const overview = computed(() => route.path === "/t/reports");
 const columns = computed(() => Object.keys(items.value[0] || {}));
+const labels = {
+  calls: "呼叫",
+  completed: "完成",
+  blocked_compliance: "合规拦截",
+  demo_excluded: "已排除演示",
+  answer_rate: "接通率",
+  avg_duration_sec: "平均时长（秒）",
+  intent_a: "意向 A",
+  intent_b: "意向 B",
+  intent_c: "意向 C",
+  intent_d: "意向 D",
+  intent_na: "意向 NA",
+  transfer_rate: "转人工率",
+  reject_rate: "拒接率",
+  ai_complete_rate: "AI 独立完成率",
+  top_compliance_rule: "合规命中最高规则",
+  no_consent_blocks: "无授权拦截",
+  dnd_blocks: "DND 拦截",
+  unquoted_items: "未报价明细",
+  degraded: "呼叫降级",
+};
+
+function labelOf(column) {
+  return labels[column] || column;
+}
+
+function formatCell(column, value) {
+  if (value === null || value === undefined || value === "") return "—";
+  if (column.endsWith("_rate")) return `${(Number(value) * 100).toFixed(1)}%`;
+  if (typeof value === "boolean") return value ? "是" : "否";
+  return value;
+}
 
 async function exportReport() {
   try {
@@ -80,3 +119,34 @@ async function load(attempt) {
 
 watch(() => route.fullPath, () => load(0), { immediate: true });
 </script>
+
+<style scoped>
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+.metric {
+  border: 1px solid #ebeef5;
+  border-radius: 4px;
+  padding: 12px;
+}
+.metric span {
+  display: block;
+  color: #909399;
+  font-size: 12px;
+}
+.metric strong {
+  display: block;
+  margin-top: 6px;
+  font-size: 20px;
+  font-weight: 500;
+  word-break: break-all;
+}
+@media (max-width: 800px) {
+  .metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+</style>

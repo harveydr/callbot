@@ -569,22 +569,95 @@ async def load_turns(session: AsyncSession, call_id: uuid.UUID) -> list[dict[str
     return [{"turn_idx": row.turn_idx, "speaker": row.speaker, "text": row.text_content} for row in rows]
 
 
+_DIALED = ("completed", "no_answer", "busy", "rejected", "failed", "transferring", "transfer_failed")
+_ANSWERED = ("completed", "transferring", "transfer_failed")
+_DND_REASONS = ("tenant_dnd", "platform_dnd")
+
+
+def _rate(numerator: int, denominator: int) -> str | None:
+    if denominator == 0:
+        return None
+    return f"{numerator / denominator:.4f}"
+
+
+def _blank_overview(*, demo_excluded: bool) -> dict[str, object]:
+    return {
+        "calls": 0,
+        "completed": 0,
+        "blocked_compliance": 0,
+        "demo_excluded": demo_excluded,
+        "answer_rate": None,
+        "avg_duration_sec": None,
+        "intent_a": 0,
+        "intent_b": 0,
+        "intent_c": 0,
+        "intent_d": 0,
+        "intent_na": 0,
+        "transfer_rate": None,
+        "reject_rate": None,
+        "ai_complete_rate": None,
+        "top_compliance_rule": "",
+        "no_consent_blocks": 0,
+        "dnd_blocks": 0,
+        "unquoted_items": 0,
+    }
+
+
 async def overview(session: AsyncSession, tenant_id: uuid.UUID) -> dict[str, object]:
+    """Tenant report. Rates stay empty when the denominator is zero. Demo data is excluded."""
     tenant = await session.scalar(select(Tenant).where(Tenant.id == tenant_id))
     if tenant is None or tenant.is_demo:
-        return {"calls": 0, "completed": 0, "blocked_compliance": 0, "demo_excluded": True}
-    calls = int(await session.scalar(select(func.count()).select_from(Call).where(Call.tenant_id == tenant_id)) or 0)
-    completed = int(
-        await session.scalar(select(func.count()).select_from(Call).where(Call.tenant_id == tenant_id, Call.status == "completed"))
-        or 0
-    )
-    blocked = int(
+        return _blank_overview(demo_excluded=True)
+    rows = (await session.scalars(select(Call).where(Call.tenant_id == tenant_id))).all()
+    dialed = [row for row in rows if row.status in _DIALED]
+    answered = [row for row in rows if row.status in _ANSWERED]
+    blocked = [row for row in rows if row.status == "blocked_compliance"]
+    completed = [row for row in rows if row.status == "completed"]
+    transferred = [row for row in rows if row.status in {"transferring", "transfer_failed"}]
+    reasons: dict[str, int] = {}
+    for row in blocked:
+        key = row.block_reason or ""
+        reasons[key] = reasons.get(key, 0) + 1
+    top = ""
+    best = 0
+    for reason, count in sorted(reasons.items()):
+        if count > best and reason:
+            best = count
+            top = reason
+    grades = {"A": 0, "B": 0, "C": 0, "D": 0, "NA": 0}
+    for row in answered:
+        if row.intent_grade in grades:
+            grades[row.intent_grade] += 1
+    duration = sum(row.duration_sec for row in answered)
+    unquoted = int(
         await session.scalar(
-            select(func.count()).select_from(Call).where(Call.tenant_id == tenant_id, Call.status == "blocked_compliance")
+            select(func.count()).select_from(BillingItem).where(BillingItem.tenant_id == tenant_id, BillingItem.amount.is_(None))
         )
         or 0
     )
-    return {"calls": calls, "completed": completed, "blocked_compliance": blocked, "demo_excluded": False}
+    report = _blank_overview(demo_excluded=False)
+    report.update(
+        {
+            "calls": len(rows),
+            "completed": len(completed),
+            "blocked_compliance": len(blocked),
+            "answer_rate": _rate(len(answered), len(dialed)),
+            "avg_duration_sec": None if not answered else round(duration / len(answered)),
+            "intent_a": grades["A"],
+            "intent_b": grades["B"],
+            "intent_c": grades["C"],
+            "intent_d": grades["D"],
+            "intent_na": grades["NA"],
+            "transfer_rate": _rate(len(transferred), len(answered)),
+            "reject_rate": _rate(sum(1 for row in dialed if row.status == "rejected"), len(dialed)),
+            "ai_complete_rate": _rate(len(completed), len(answered)),
+            "top_compliance_rule": top,
+            "no_consent_blocks": reasons.get("no_valid_consent", 0),
+            "dnd_blocks": sum(reasons.get(reason, 0) for reason in _DND_REASONS),
+            "unquoted_items": unquoted,
+        }
+    )
+    return report
 
 
 async def billing_summary(session: AsyncSession, tenant_id: uuid.UUID) -> dict[str, object]:
