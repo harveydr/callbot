@@ -40,6 +40,14 @@ services:
     command: celery -A app.tasks worker -Q dispatch,io_heavy,billing,report -l info --prefetch-multiplier=1
     depends_on: [redis, db]
     restart: unless-stopped
+  beat:
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile
+    env_file: ../.env
+    command: celery -A app.tasks beat -l info
+    depends_on: [redis, db]
+    restart: unless-stopped
   voice:
     build:
       context: ..

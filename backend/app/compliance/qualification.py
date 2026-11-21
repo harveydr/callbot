@@ -38,6 +38,22 @@ async def _alert_once(
         session.add(Alert(tenant_id=tenant_id, severity=severity, code=code, message=message))
 
 
+async def sweep_qualifications(session: AsyncSession, now: datetime) -> int:
+    """Suspend expired licenses even when nobody is dialing. Closed tenants stay closed."""
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware UTC")
+    tenants = (
+        await session.scalars(select(Tenant).where(Tenant.status.in_(("pending", "active", "suspended"))))
+    ).all()
+    suspended = 0
+    for tenant in tenants:
+        before = tenant.status
+        await apply_qualification_clock(session, tenant, now)
+        if before == "active" and tenant.status == "suspended":
+            suspended += 1
+    return suspended
+
+
 async def apply_qualification_clock(session: AsyncSession, tenant: Tenant, now: datetime) -> None:
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware UTC")

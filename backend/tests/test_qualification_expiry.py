@@ -7,7 +7,8 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.compliance.qualification import apply_qualification_clock
+from app.compliance.qualification import apply_qualification_clock, sweep_qualifications
+from app.tasks import celery_app
 from app.config import load_settings
 from app.db import set_bypass
 from app.models import Call, Campaign, ConsentRecord, Contact, ContactList, Qualification, ScenarioTemplate, Task, Tenant, Trunk
@@ -79,6 +80,68 @@ async def test_windows_alert_once_and_expiry_suspends(session_factory: async_ses
         assert later.status == "suspended" and expired.status == "expired"
         assert expired_alert is not None and expired_alert.severity == "critical"
         assert safe_alert is None
+
+
+async def test_sweep_suspends_an_expired_license_without_a_dial(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        await set_bypass(session)
+        licensed = await _tenant(session, "qual-sweep")
+        other_doc = await _tenant(session, "qual-other")
+        closed = await _tenant(session, "qual-closed")
+        closed.status = "closed"
+        session.add_all(
+            [
+                Qualification(
+                    tenant_id=licensed.id,
+                    doc_type="business_license",
+                    file_key="sweep",
+                    status="approved",
+                    expires_at=NOW - timedelta(hours=1),
+                ),
+                Qualification(
+                    tenant_id=other_doc.id,
+                    doc_type="script_filing",
+                    file_key="other",
+                    status="approved",
+                    expires_at=NOW - timedelta(hours=1),
+                ),
+                Qualification(
+                    tenant_id=closed.id,
+                    doc_type="business_license",
+                    file_key="closed",
+                    status="approved",
+                    expires_at=NOW - timedelta(hours=1),
+                ),
+            ]
+        )
+        await session.flush()
+        first = await sweep_qualifications(session, NOW)
+        second = await sweep_qualifications(session, NOW)
+        alerts = int(
+            await session.scalar(
+                select(func.count()).select_from(Alert).where(Alert.tenant_id == licensed.id, Alert.code == "qualification_expired")
+            )
+            or 0
+        )
+        other = await session.scalar(select(Qualification).where(Qualification.tenant_id == other_doc.id))
+        assert first == 1
+        assert second == 0
+        assert licensed.status == "suspended"
+        assert other_doc.status == "active"
+        assert other is not None and other.status == "expired"
+        assert closed.status == "closed"
+        assert alerts == 1
+
+
+def test_qualification_sweep_runs_before_the_calling_window() -> None:
+    entry = celery_app.conf.beat_schedule["sweep-qualifications"]
+    schedule = entry["schedule"]
+    assert entry["task"] == "sweep_qualifications"
+    assert celery_app.conf.timezone == "Asia/Shanghai"
+    assert schedule.hour == {0}
+    assert schedule.minute == {10}
 
 
 async def test_expired_license_blocks_the_dial(
