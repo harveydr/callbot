@@ -76,7 +76,27 @@ async function exportReport() {
     return;
   }
   const response = await api.get("/api/t/reports/export");
-  exportNote.value = `已生成导出任务 ${response.data.data.task_id}，15 分钟内有效`;
+  let data = response.data.data;
+  for (let attempt = 0; attempt < 10 && data.status === "running"; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const polled = await api.get("/api/t/reports/export", { params: { task_id: data.task_id } });
+    data = polled.data.data;
+  }
+  if (data.status === "done" && data.download_token) {
+    const file = await api.get("/api/t/reports/export", {
+      params: { task_id: data.task_id, download: 1, token: data.download_token },
+      responseType: "blob",
+    });
+    const url = URL.createObjectURL(file.data);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `report-${data.task_id}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+    exportNote.value = `报表已下载，任务 ${data.task_id}，15 分钟内有效`;
+    return;
+  }
+  exportNote.value = `导出任务 ${data.task_id} 仍在生成`;
 }
 
 async function load(attempt) {

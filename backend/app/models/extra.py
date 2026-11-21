@@ -328,4 +328,5 @@ class ReportExport(Base):
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'done'"))
     download_token: Mapped[str | None] = mapped_column(Text)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    body: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = _ts()

@@ -6,7 +6,7 @@ import secrets
 import uuid
 
 from fastapi import Depends, File, Header, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,7 +36,7 @@ from app.models import Call, CallEvent, CallerNumber, Campaign, ConsentRecord, C
 from app.models.extra import BillingItem, Complaint, EvidencePack, ImportJob, QcResult, ReportExport, ScriptNode, Transcript
 from app.security.crypto import PhoneInvalidError, encrypt_phone, encrypt_secret, normalize_phone, phone_hash
 from app.security.sip import assert_public_sip_host
-from app.services.exports import export_expires_at
+from app.services.exports import export_is_usable, export_payload, render_report
 from app.voice.stereo import recording_payload
 from app.services.control import (
     assert_caller,
@@ -865,17 +865,50 @@ async def overview_route(
     return envelope(request.state.trace_id, data)
 
 
-@tenant_router.get("/reports/export")
+@tenant_router.get("/reports/export", response_model=None)
 async def export_route(
     request: Request,
     principal: Principal = Depends(require_roles("tenant_admin")),
     session: AsyncSession = Depends(db_session),
-) -> dict[str, object]:
-    token = secrets.token_urlsafe(24)
-    row = ReportExport(tenant_id=require_tenant(principal), status="done", download_token=token, expires_at=export_expires_at(utcnow()))
+    task_id: uuid.UUID | None = None,
+    download: int = 0,
+    token: str = "",
+) -> dict[str, object] | Response:
+    tenant_id = require_tenant(principal)
+    if task_id is not None:
+        row = await session.scalar(select(ReportExport).where(ReportExport.id == task_id, ReportExport.tenant_id == tenant_id))
+        if row is None:
+            raise ApiError(404, "NOT_FOUND", "export not found")
+        if download:
+            if row.status != "done" or not row.download_token or row.expires_at is None:
+                raise ApiError(409, "CONFLICT", "export is not ready")
+            if token != row.download_token:
+                raise ApiError(403, "FORBIDDEN", "export token rejected")
+            if not export_is_usable(expires_at=row.expires_at, now=utcnow()):
+                raise ApiError(410, "GONE", "export link is expired")
+            filename = f"report-{row.id}.csv"
+            return Response(
+                content=row.body or "",
+                media_type="text/csv",
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
+        return envelope(request.state.trace_id, export_payload(row, utcnow()))
+    row = ReportExport(id=uuid.uuid4(), tenant_id=tenant_id, status="running")
     session.add(row)
     await session.flush()
-    return envelope(request.state.trace_id, {"task_id": str(row.id), "status": row.status, "download_token": token})
+    if request.app.state.settings.celery_enqueue:
+        await session.commit()
+        await set_tenant(session, tenant_id)
+        from app.tasks.reports import render_report_task
+
+        try:
+            render_report_task.delay(str(row.id))
+        except Exception as exc:
+            row.status = "failed"
+            raise ApiError(503, "UNAVAILABLE", "report queue is unavailable") from exc
+    else:
+        row = await render_report(session, row.id, utcnow())
+    return envelope(request.state.trace_id, export_payload(row, utcnow()))
 
 
 @tenant_router.get("/ws/tickets")
