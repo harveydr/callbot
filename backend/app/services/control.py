@@ -23,6 +23,7 @@ from app.errors import ApiError
 from app.models import (
     AuditLog,
     Call,
+    CallEvent,
     CallerNumber,
     Campaign,
     ConsentRecord,
@@ -533,8 +534,46 @@ async def start_campaign(
     return {"campaign_id": str(campaign.id), "task_count": total, "idempotent": False, "started": started}
 
 
+_COMPLAINT_WARN = Decimal("0.003")
+_COMPLAINT_STOP = Decimal("0.010")
+
+
+async def _note_complaint_rate(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    call_id: uuid.UUID,
+    severity: str,
+    message: str,
+    now: datetime,
+) -> None:
+    existing = await session.scalar(
+        select(Alert.id).where(Alert.tenant_id == tenant_id, Alert.code == "complaint_rate", Alert.message == message)
+    )
+    if existing is not None:
+        return
+    session.add(
+        Alert(
+            tenant_id=tenant_id,
+            severity=severity,
+            code="complaint_rate",
+            message=message,
+            created_at=now,
+        )
+    )
+    session.add(
+        CallEvent(
+            tenant_id=tenant_id,
+            call_id=call_id,
+            event_type="complaint_rate",
+            detail={"severity": severity, "message": message},
+            created_at=now,
+        )
+    )
+
+
 async def _block_caller_if_complaint_rate(
-    session: AsyncSession, *, tenant_id: uuid.UUID, call_id: uuid.UUID | None
+    session: AsyncSession, *, tenant_id: uuid.UUID, call_id: uuid.UUID | None, now: datetime | None = None
 ) -> None:
     if call_id is None:
         return
@@ -546,8 +585,9 @@ async def _block_caller_if_complaint_rate(
     )
     if number is None:
         return
+    moment = now or datetime.now(timezone.utc)
     number.complaint_count_30d += 1
-    since = datetime.now(timezone.utc) - timedelta(days=30)
+    since = moment - timedelta(days=30)
     dialed = int(
         await session.scalar(
             select(func.count())
@@ -561,8 +601,29 @@ async def _block_caller_if_complaint_rate(
         )
         or 0
     )
-    if dialed > 0 and Decimal(number.complaint_count_30d) / Decimal(dialed) >= Decimal("0.0100"):
+    if dialed <= 0:
+        return
+    rate = Decimal(number.complaint_count_30d) / Decimal(dialed)
+    if rate >= _COMPLAINT_STOP:
         number.status = "blocked"
+        await _note_complaint_rate(
+            session,
+            tenant_id=tenant_id,
+            call_id=call.id,
+            severity="critical",
+            message=f"主叫 {number.number} 30 日投诉率达到 0.010，已停用",
+            now=moment,
+        )
+        return
+    if rate >= _COMPLAINT_WARN:
+        await _note_complaint_rate(
+            session,
+            tenant_id=tenant_id,
+            call_id=call.id,
+            severity="warning",
+            message=f"主叫 {number.number} 30 日投诉率达到 0.003",
+            now=moment,
+        )
 
 
 async def open_complaint(

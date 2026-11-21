@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import load_settings
 from app.db import set_bypass
-from app.models import Call, CallerNumber, Campaign, ConsentRecord, Contact, ContactList, ScenarioTemplate, Task, Tenant, Trunk, User
+from app.models import Call, CallEvent, CallerNumber, Campaign, ConsentRecord, Contact, ContactList, ScenarioTemplate, Task, Tenant, Trunk, User
 from app.compliance.offwindow import flag_offwindow_calls
 from app.models.extra import Alert, CallTurn, NumberHealthStat, ScriptNode
 from app.security.crypto import encrypt_phone, phone_hash
@@ -421,3 +421,123 @@ async def test_one_complaint_blocks_a_caller_at_the_stop_rate(
         )
         assert caller.complaint_count_30d == 1
         assert caller.status == "blocked"
+        stopped = await session.scalar(select(Alert).where(Alert.tenant_id == tenant.id, Alert.code == "complaint_rate"))
+        assert stopped is not None and stopped.severity == "critical"
+        assert stopped.message == "主叫 02180001111 30 日投诉率达到 0.010，已停用"
+
+
+async def test_complaint_rate_warns_before_it_blocks(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    settings = load_settings()
+    async with session_factory() as session:
+        await set_bypass(session)
+        tenant, trunk, campaign, contact, caller = await _world(session, "dispatch-rate", phone="13800008881")
+        user = User(
+            tenant_id=tenant.id,
+            username="dispatch-rate-admin",
+            password_hash=hash_password("password12"),
+            display_name="admin",
+            role="tenant_admin",
+            must_change_password=False,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(user)
+        calls = [
+            Call(
+                tenant_id=tenant.id,
+                campaign_id=campaign.id,
+                contact_id=contact.id,
+                call_uuid=uuid.uuid4(),
+                status="no_answer",
+                caller_number=caller.number,
+                trunk_id=trunk.id,
+                template_version=1,
+                start_at=NOW,
+            )
+            for _ in range(200)
+        ]
+        session.add_all(calls)
+        await session.flush()
+        await open_complaint(
+            session,
+            tenant_id=tenant.id,
+            phone="13800008881",
+            detail="第一次投诉",
+            settings=settings,
+            user_id=user.id,
+            trace_id="warn",
+            call_id=calls[0].id,
+        )
+        warned = (await session.scalars(select(Alert).where(Alert.tenant_id == tenant.id, Alert.code == "complaint_rate"))).all()
+        assert caller.status == "active"
+        assert [row.severity for row in warned] == ["warning"]
+        assert warned[0].message == "主叫 02180001111 30 日投诉率达到 0.003"
+        await open_complaint(
+            session,
+            tenant_id=tenant.id,
+            phone="13800008882",
+            detail="第二次投诉",
+            settings=settings,
+            user_id=user.id,
+            trace_id="stop",
+            call_id=calls[1].id,
+        )
+        alerts = (await session.scalars(select(Alert).where(Alert.tenant_id == tenant.id, Alert.code == "complaint_rate"))).all()
+        event = await session.scalar(
+            select(CallEvent).where(CallEvent.call_id == calls[0].id, CallEvent.event_type == "complaint_rate")
+        )
+        assert caller.status == "blocked"
+        assert sorted(row.severity for row in alerts) == ["critical", "warning"]
+        assert event is not None and event.detail["severity"] == "warning"
+
+
+async def test_complaint_rate_under_the_warn_line_stays_quiet(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    settings = load_settings()
+    async with session_factory() as session:
+        await set_bypass(session)
+        tenant, trunk, campaign, contact, caller = await _world(session, "dispatch-quiet", phone="13800008883")
+        user = User(
+            tenant_id=tenant.id,
+            username="dispatch-quiet-admin",
+            password_hash=hash_password("password12"),
+            display_name="admin",
+            role="tenant_admin",
+            must_change_password=False,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(user)
+        calls = [
+            Call(
+                tenant_id=tenant.id,
+                campaign_id=campaign.id,
+                contact_id=contact.id,
+                call_uuid=uuid.uuid4(),
+                status="completed",
+                caller_number=caller.number,
+                trunk_id=trunk.id,
+                template_version=1,
+                start_at=NOW,
+            )
+            for _ in range(334)
+        ]
+        session.add_all(calls)
+        await session.flush()
+        await open_complaint(
+            session,
+            tenant_id=tenant.id,
+            phone="13800008883",
+            detail="偶发投诉",
+            settings=settings,
+            user_id=user.id,
+            trace_id="quiet",
+            call_id=calls[0].id,
+        )
+        alerts = (await session.scalars(select(Alert).where(Alert.code == "complaint_rate"))).all()
+        assert caller.status == "active"
+        assert caller.complaint_count_30d == 1
+        assert alerts == []
