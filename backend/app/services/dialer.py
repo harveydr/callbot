@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
 from typing import cast
-from zoneinfo import ZoneInfo
 
 import redis.asyncio as redis_async
 from sqlalchemy import or_, select
@@ -24,13 +22,13 @@ from app.models.extra import (
     BillingRate,
     CallTransfer,
     CallTurn,
-    NumberHealthStat,
     QcResult,
     Recording,
     ScriptNode,
     Transcript,
 )
 from app.services.billing_budget import apply_billing_budget
+from app.services.number_health import refresh_caller_health
 from app.services.tokens import TokenBucket
 from app.voice.circuit import CircuitPort, SharedVendorCircuit
 from app.voice.orchestrator import Frame, run_session
@@ -353,25 +351,8 @@ async def _callback(
     )
 
 
-async def _touch_health(session: AsyncSession, caller: CallerNumber, *, answered: bool, now: datetime) -> None:
-    day = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
-    stat = await session.scalar(
-        select(NumberHealthStat).where(NumberHealthStat.caller_number_id == caller.id, NumberHealthStat.stat_day == day)
-    )
-    rate = Decimal("1.0000") if answered else Decimal("0.0000")
-    if stat is None:
-        session.add(
-            NumberHealthStat(
-                tenant_id=caller.tenant_id,
-                caller_number_id=caller.id,
-                stat_day=day,
-                answer_rate=rate,
-                complaint_count=caller.complaint_count_30d,
-            )
-        )
-        return
-    stat.answer_rate = rate
-    stat.complaint_count = caller.complaint_count_30d
+async def _touch_health(session: AsyncSession, caller: CallerNumber, now: datetime) -> None:
+    await refresh_caller_health(session, caller, now)
 
 
 async def _blocked(
@@ -518,7 +499,7 @@ async def _place(
     elif status == "completed" and wants_reschedule(heard):
         await _callback(session, campaign, contact, task, call, now, timedelta(days=1))
     if caller is not None:
-        await _touch_health(session, caller, answered=status == "completed", now=now)
+        await _touch_health(session, caller, now)
     if outcome.needs_dnd:
         await on_caller_text(
             session,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -138,7 +139,7 @@ async def test_script_and_caller_are_used(session_factory: async_sessionmaker[As
         assert call is not None and call.caller_number == "02180001111" and call.status == "transfer_failed"
         assert spoken is not None and "必须播报的开场要点。" in spoken and "为您转接人工。" in spoken
         assert callback is not None and callback.next_run_at == NOW + timedelta(minutes=30)
-        assert health is not None and health.answer_rate == 0
+        assert health is not None and health.answer_rate == Decimal("1.0000")
 
 
 async def test_future_callback_waits_until_it_is_due(
