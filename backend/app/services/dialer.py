@@ -30,6 +30,7 @@ from app.models.extra import (
 )
 from app.services.tokens import TokenBucket
 from app.voice.orchestrator import Frame, run_session
+from app.voice.stereo import write_recording
 
 EXPLICIT_AIGC = "以下为人工智能生成合成语音"
 _RETRYABLE = ("no_answer", "busy")
@@ -431,7 +432,7 @@ async def _place(
         Recording(
             tenant_id=campaign.tenant_id,
             call_id=call.id,
-            object_key=f"recordings/{tenant.id}/{call_uuid}.wav",
+            object_key=write_recording(tenant.id, call_uuid, outcome.turns),
             aigc_label_meta=meta,
             explicit_label=EXPLICIT_AIGC,
             created_by=campaign.created_by,

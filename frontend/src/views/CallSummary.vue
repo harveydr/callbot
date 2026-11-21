@@ -4,6 +4,7 @@
     <StateView :status="status" :message="message" @retry="load">
       <p v-if="summary">{{ summary }}</p>
       <p v-else>{{ note }}</p>
+      <audio v-if="audioSrc" :src="audioSrc" controls></audio>
       <el-table :data="turns">
         <el-table-column prop="speaker" label="说话方" />
         <el-table-column prop="text" label="内容" />
@@ -23,6 +24,7 @@ const status = ref("loading");
 const message = ref("");
 const note = ref("");
 const summary = ref("");
+const audioSrc = ref("");
 const turns = ref([]);
 
 async function load() {
@@ -30,6 +32,8 @@ async function load() {
     const response = await api.get(`/api/t/calls/${route.params.id}/transcript`);
     note.value = response.data.data.note;
     summary.value = response.data.data.summary || "";
+    const media = response.data.data.recording?.media_base64;
+    audioSrc.value = media ? `data:audio/wav;base64,${media}` : "";
     turns.value = response.data.data.body?.turns || [];
     status.value = "ready";
   } catch (err) {

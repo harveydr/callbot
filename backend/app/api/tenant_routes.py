@@ -36,6 +36,7 @@ from app.models.extra import BillingItem, Complaint, EvidencePack, ImportJob, Qc
 from app.security.crypto import PhoneInvalidError, encrypt_phone, encrypt_secret, normalize_phone, phone_hash
 from app.security.sip import assert_public_sip_host
 from app.services.exports import export_expires_at
+from app.voice.stereo import recording_payload
 from app.services.control import (
     assert_caller,
     assert_freq,
@@ -607,9 +608,21 @@ async def transcript(
 ) -> dict[str, object]:
     call = await owned(session, Call, call_id, require_tenant(principal))
     row = await session.scalar(select(Transcript).where(Transcript.call_id == call.id))
+    recording = recording_payload(call.tenant_id, call.call_uuid)
     if row is None:
-        return envelope(request.state.trace_id, {"summary": None, "body": None, "note": "AI 小结生成中"})
-    return envelope(request.state.trace_id, {"summary": row.summary, "body": row.body, "note": "AI 小结生成中" if row.summary is None else "ok"})
+        return envelope(
+            request.state.trace_id,
+            {"summary": None, "body": None, "note": "AI 小结生成中", "recording": recording},
+        )
+    return envelope(
+        request.state.trace_id,
+        {
+            "summary": row.summary,
+            "body": row.body,
+            "note": "AI 小结生成中" if row.summary is None else "ok",
+            "recording": recording,
+        },
+    )
 
 
 @tenant_router.get("/qc-results")
