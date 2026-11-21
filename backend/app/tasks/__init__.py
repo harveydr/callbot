@@ -36,6 +36,10 @@ celery_app.conf.update(
             "task": "ensure_audit_partitions",
             "schedule": crontab(hour=0, minute=20),
         },
+        "purge-closed-tenants": {
+            "task": "purge_closed_tenants",
+            "schedule": crontab(hour=0, minute=30),
+        },
     },
     task_routes={
         "dispatch_campaign": {"queue": "dispatch"},
@@ -46,12 +50,14 @@ celery_app.conf.update(
         "render_report": {"queue": "report"},
         "sweep_qualifications": {"queue": "dispatch"},
         "ensure_audit_partitions": {"queue": "dispatch"},
+        "purge_closed_tenants": {"queue": "dispatch"},
     },
     task_annotations={
         "dispatch_campaign": {"time_limit": 60},
         "dispatch_due_campaigns": {"time_limit": 60},
         "sweep_qualifications": {"time_limit": 60},
         "ensure_audit_partitions": {"time_limit": 60},
+        "purge_closed_tenants": {"time_limit": 60},
         "import_contacts": {"time_limit": 600},
         "billing_reconcile": {"time_limit": 120},
         "probe_missing_cdr": {"time_limit": 120},
@@ -74,6 +80,7 @@ app = celery_app
 
 from app.tasks import billing_schedule as billing_schedule_task  # noqa: E402,F401
 from app.tasks import dispatch as dispatch_task  # noqa: E402,F401
+from app.tasks import erasure as erasure_task  # noqa: E402,F401
 from app.tasks import imports as import_task  # noqa: E402,F401
 from app.tasks import partitions as partition_task  # noqa: E402,F401
 from app.tasks import qualification as qualification_task  # noqa: E402,F401

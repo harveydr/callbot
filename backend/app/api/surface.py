@@ -19,6 +19,7 @@ from app.errors import ApiError
 from app.models import Call, Qualification, Tenant, User
 from app.models.extra import Alert, CircuitState, UserRole
 from app.security.passwords import hash_password
+from app.services.erasure import close_tenant
 from app.services.control import (
     bump,
     change_password,
@@ -73,6 +74,7 @@ class TenantPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     version: int
     name: str | None = None
+    status: str | None = None
     daily_call_quota: int | None = Field(default=None, gt=0)
     billing_budget: Decimal | None = Field(default=None, gt=0, max_digits=12, decimal_places=4)
 
@@ -422,13 +424,17 @@ async def patch_tenant_route(
         tenant.daily_call_quota = body.daily_call_quota
     if "billing_budget" in body.model_fields_set:
         tenant.billing_budget = body.billing_budget
+    if "status" in body.model_fields_set and body.status is not None:
+        if body.status != "closed":
+            raise ApiError(422, "VALIDATION", "status is invalid")
+        await close_tenant(session, tenant, user_id=principal.user_id, trace_id=request.state.trace_id)
     tenant.updated_at = utcnow()
-    del principal
     return envelope(
         request.state.trace_id,
         {
             "id": str(tenant.id),
             "version": tenant.version,
+            "status": tenant.status,
             "billing_budget": None if tenant.billing_budget is None else format(tenant.billing_budget, "f"),
         },
     )
@@ -530,6 +536,9 @@ async def resume_route(
     session: AsyncSession = Depends(db_session),
 ) -> dict[str, object]:
     del principal
+    current = await session.scalar(select(Tenant).where(Tenant.id == tenant_id))
+    if current is not None and current.status == "closed":
+        raise ApiError(409, "CONFLICT", "closed tenant cannot resume")
     tenant = await _set_tenant_status(session, tenant_id, "active")
     return envelope(request.state.trace_id, {"id": str(tenant.id), "status": tenant.status})
 

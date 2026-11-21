@@ -13,6 +13,7 @@ _NAMES = (
     "probe_missing_cdr",
     "sweep_qualifications",
     "ensure_audit_partitions",
+    "purge_closed_tenants",
 )
 
 
