@@ -424,8 +424,26 @@ def test_a_colloquial_amount_is_a_price_claim() -> None:
     assert "99块" not in refused
     assert "两块钱" not in refused
     assert "必须播报。" in refused
-    assert "不在本次说明范围内" in refused
+    assert "这个问题我记下来" in refused
     assert plain == f"{opening}请到第一单元。"
+
+
+async def test_a_promise_is_replaced_and_the_opening_is_put_back() -> None:
+    outcome = await run_session(
+        [Frame("caller", "PCM:请问一下".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        llm_mode="promise",
+        script=_priced_script("我们保证收益。"),
+    )
+    assert outcome.opening_forced is True
+    assert outcome.redline_hits == ["promise_return"]
+    assert outcome.action == "speak"
+    assert "保证收益" not in outcome.reply_text
+    assert "这个问题我记下来" in outcome.reply_text
+    assert "必须播报的开场要点。" in outcome.reply_text
+    assert opening_is_complete(outcome.reply_text)
+    assert outcome.reply_text.startswith("您好，我是回声的人工智能语音助理。")
 
 
 async def test_a_refusal_is_not_followed_by_another_pitch() -> None:
@@ -503,11 +521,11 @@ async def test_a_free_answer_cannot_leave_the_node_knowledge() -> None:
     )
     assert "99 元" not in refused.reply_text
     assert "合同" not in refused.reply_text
-    assert "不在本次说明范围内" in refused.reply_text
+    assert "这个问题我记下来" in refused.reply_text
     assert "必须播报的开场要点。" in refused.reply_text
     assert opening_is_complete(refused.reply_text)
     assert "费用是 99 元，合同自动续费。" in allowed.reply_text
-    assert "不在本次说明范围内" not in allowed.reply_text
+    assert "这个问题我记下来" not in allowed.reply_text
     spoken = await run_session(
         [Frame("caller", "PCM:请问一下".encode("utf-8"))],
         company="回声",
@@ -523,7 +541,7 @@ async def test_a_free_answer_cannot_leave_the_node_knowledge() -> None:
         script=_priced_script("一共九十九块。"),
     )
     assert "九十九块" not in spoken.reply_text
-    assert "不在本次说明范围内" in spoken.reply_text
+    assert "这个问题我记下来" in spoken.reply_text
     assert "一共九十九块。" in kept.reply_text
     assert opening_is_complete(spoken.reply_text)
 
@@ -841,6 +859,48 @@ async def test_a_slow_second_pass_is_kept_and_recorded(
     assert campaign.status == "running"
     assert event is not None and event.detail == {"timeout_ms": 30}
     assert spoken is not None and "必须播报的开场要点。" in spoken and opening_is_complete(spoken)
+
+
+async def test_a_rewritten_reply_puts_the_opening_back_on_the_call(
+    session_factory: async_sessionmaker[AsyncSession], redis_client
+) -> None:
+    settings = load_settings()
+
+    def judge(_text: str) -> list[str]:
+        return ["promise_return"]
+
+    async with session_factory() as session:
+        await set_bypass(session)
+        tenant, trunk, campaign, contact, _caller = await _world(session, "opening-forced", phone="13800006787")
+        session.add(Task(tenant_id=tenant.id, campaign_id=campaign.id, contact_id=contact.id, attempt_no=1, status="pending"))
+        await session.flush()
+        started = await dial_pending(
+            session,
+            campaign=campaign,
+            tenant=tenant,
+            trunk=trunk,
+            settings=settings,
+            redis=redis_client,
+            now=NOW,
+            heard="好的",
+            guard_judge=judge,
+            guard_clock=iter((0.0, 0.03)).__next__,
+        )
+        call = await session.scalar(select(Call).where(Call.contact_id == contact.id))
+        event = (
+            await session.scalar(
+                select(CallEvent).where(CallEvent.call_id == call.id, CallEvent.event_type == "ai_notice_forced")
+            )
+            if call is not None
+            else None
+        )
+        spoken = await session.scalar(select(CallTurn.text_content).where(CallTurn.speaker == "assistant"))
+    assert started == 1
+    assert call is not None and {"rule": "forced_ai_notice"} in call.compliance_hit
+    assert {"rule": "promise_return"} in call.compliance_hit
+    assert event is not None and event.detail == {"opening_complete": True}
+    assert spoken is not None and spoken.startswith("您好，我是") and "这个问题我记下来" in spoken
+    assert opening_is_complete(spoken)
 
 
 def test_silence_uses_the_node_time_limit() -> None:

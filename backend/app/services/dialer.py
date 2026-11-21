@@ -559,7 +559,10 @@ async def _place(
         latency_p50_ms=round(outcome.latency_ms),
         latency_p95_ms=round(outcome.latency_ms),
         intent_grade=outcome.intent_grade,
-        compliance_hit=[{"rule": code} for code in outcome.redline_hits],
+        compliance_hit=[
+            *[{"rule": code} for code in outcome.redline_hits],
+            *([{"rule": "forced_ai_notice"}] if outcome.opening_forced else []),
+        ],
         created_by=campaign.created_by,
     )
     reach(call, status)
@@ -683,9 +686,18 @@ async def _place(
             tenant_id=campaign.tenant_id,
             call_id=call.id,
             event_type="ai_notice",
-            detail={"played": True},
+            detail={"played": True, "forced": outcome.opening_forced},
         )
     )
+    if outcome.opening_forced:
+        session.add(
+            CallEvent(
+                tenant_id=campaign.tenant_id,
+                call_id=call.id,
+                event_type="ai_notice_forced",
+                detail={"opening_complete": True},
+            )
+        )
     if outcome.guard_timeout:
         session.add(
             CallEvent(

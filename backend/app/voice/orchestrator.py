@@ -7,9 +7,9 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from app.compliance.opening import render_opening
+from app.compliance.opening import opening_is_complete, render_opening
 from app.llm.prompt import render_intent_prompt, render_response_prompt, sample_for_attempt, spoken_line
-from app.compliance.redline import review_assistant_text
+from app.compliance.redline import review_assistant_text, scan_redline
 from app.voice.asr import MockAsr, VendorRejected, decode_pcm
 from app.voice.circuit import CircuitPort, VendorCircuit
 from app.voice.intent import classify_intent
@@ -69,6 +69,7 @@ class Outcome:
     demand_stop: bool = False
     script_tree: bool = False
     guard_timeout: bool = False
+    opening_forced: bool = False
     llm_temperatures: list[float] = field(default_factory=list)
 
 
@@ -134,6 +135,8 @@ def _payloads(llm_mode: str, heard: str) -> list[str | None]:
         return [json.dumps({"intent": "refuse", "say": "您再考虑一下。这是最后一次优惠。"}, ensure_ascii=False)]
     if llm_mode == "retain_stop":
         return [json.dumps({"intent": "inquiry", "demand_stop": True, "say": "您再考虑一下。这是最后一次优惠。"}, ensure_ascii=False)]
+    if llm_mode == "promise":
+        return [json.dumps({"intent": "inquiry", "say": "我们保证收益。"}, ensure_ascii=False)]
     if llm_mode == "flagged_stop":
         return [json.dumps({"intent": "inquiry", "demand_stop": True}, ensure_ascii=False)]
     if llm_mode == "flagged_human":
@@ -376,7 +379,7 @@ async def run_session(
             else:
                 intent = "inquiry" if llm_mode != "ok" else classify_intent(heard)
             say = parsed.get("say") if parsed is not None else None
-            if llm_mode in {"priced", "colloquial", "long_say", "retain", "retain_stop"} and isinstance(say, str):
+            if llm_mode in {"priced", "colloquial", "long_say", "retain", "retain_stop", "promise"} and isinstance(say, str):
                 model_say = say
             if llm_mode != "hostile":
                 ask_human = parsed.get("ask_human") is True if parsed is not None else False
@@ -434,8 +437,11 @@ async def run_session(
     guarded, hits, guard_action = reviewed.text, reviewed.hits, reviewed.action
     guard_timeout = reviewed.timed_out
     for line in mandatory:
-        if line not in guarded:
+        if line not in guarded and not scan_redline(line):
             guarded = f"{line}{guarded}"
+    opening_forced = not opening_is_complete(guarded)
+    if opening_forced:
+        guarded = f"{opening}{guarded}"
     if demand_stop:
         action = "hangup"
         if _STOP_CONFIRM not in guarded:
@@ -489,5 +495,6 @@ async def run_session(
         demand_stop=demand_stop,
         script_tree=script_tree,
         guard_timeout=guard_timeout,
+        opening_forced=opening_forced,
         llm_temperatures=llm_temperatures,
     )
