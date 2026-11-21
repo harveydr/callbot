@@ -15,6 +15,7 @@ from app.compliance.gate_pre import (
     pre_dial_gate,
 )
 from app.compliance.guard_incall import guard_model_output, on_caller_text
+from app.compliance.redline import review_assistant_text, scan_redline
 from app.compliance.opening import render_opening
 from app.db import set_bypass, set_tenant
 from app.models import (
@@ -396,3 +397,30 @@ async def test_redline_rewrites_then_hangs_up() -> None:
     _spoken, second_hits, second_action = guard_model_output("百分百稳赚。", prior_hits=1)
     assert second_hits == ["promise_return"]
     assert second_action == "hangup"
+
+
+def test_a_negated_promise_stays_until_the_second_pass() -> None:
+    calls: list[str] = []
+
+    def judge(text: str) -> list[str]:
+        calls.append(text)
+        return ["promise_return"] if "疗效" in text else []
+
+    assert scan_redline("我们不保证收益") == []
+    assert scan_redline("我们保证收益") == ["promise_return"]
+    local = review_assistant_text("我们保证收益", prior_hits=0, judge=judge)
+    allowed = review_assistant_text("我们不保证收益", prior_hits=0, judge=judge)
+    caught = review_assistant_text("这个疗效很好", prior_hits=0, judge=judge)
+    slow = review_assistant_text("这个疗效很好", prior_hits=0, judge=judge, clock=iter((0.0, 0.04)).__next__)
+    on_time = review_assistant_text("这个疗效很好", prior_hits=0, judge=judge, clock=iter((0.0, 0.03)).__next__)
+    assert local.action == "rewrite"
+    assert calls == ["我们不保证收益", "这个疗效很好", "这个疗效很好", "这个疗效很好"]
+    assert "不保证收益" in allowed.text
+    assert allowed.timed_out is False
+    assert caught.action == "rewrite"
+    assert "疗效" not in caught.text
+    assert slow.timed_out is True
+    assert slow.action == "allow"
+    assert "疗效很好" in slow.text
+    assert on_time.timed_out is False
+    assert on_time.action == "rewrite"

@@ -713,6 +713,44 @@ async def test_two_model_failures_mark_the_call_script_tree(
         circuit.close()
 
 
+async def test_a_slow_second_pass_is_kept_and_recorded(
+    session_factory: async_sessionmaker[AsyncSession], redis_client
+) -> None:
+    settings = load_settings()
+
+    def judge(_text: str) -> list[str]:
+        return ["promise_return"]
+
+    async with session_factory() as session:
+        await set_bypass(session)
+        tenant, trunk, campaign, contact, _caller = await _world(session, "guard-slow", phone="13800006784")
+        session.add(Task(tenant_id=tenant.id, campaign_id=campaign.id, contact_id=contact.id, attempt_no=1, status="pending"))
+        await session.flush()
+        started = await dial_pending(
+            session,
+            campaign=campaign,
+            tenant=tenant,
+            trunk=trunk,
+            settings=settings,
+            redis=redis_client,
+            now=NOW,
+            heard="好的",
+            guard_judge=judge,
+            guard_clock=iter((0.0, 0.04)).__next__,
+        )
+        call = await session.scalar(select(Call).where(Call.contact_id == contact.id))
+        event = (
+            await session.scalar(select(CallEvent).where(CallEvent.call_id == call.id, CallEvent.event_type == "guard_timeout"))
+            if call is not None
+            else None
+        )
+        spoken = await session.scalar(select(CallTurn.text_content).where(CallTurn.speaker == "assistant"))
+    assert started == 1
+    assert campaign.status == "running"
+    assert event is not None and event.detail == {"timeout_ms": 30}
+    assert spoken is not None and "必须播报的开场要点。" in spoken and opening_is_complete(spoken)
+
+
 async def test_a_format_error_is_stored_on_the_call(
     session_factory: async_sessionmaker[AsyncSession], redis_client
 ) -> None:

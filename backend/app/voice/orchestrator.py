@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from app.compliance.opening import render_opening
-from app.compliance.redline import guard_assistant_text
+from app.compliance.redline import review_assistant_text
 from app.voice.asr import MockAsr, VendorRejected, decode_pcm
 from app.voice.circuit import CircuitPort, VendorCircuit
 from app.voice.intent import classify_intent
@@ -67,6 +67,7 @@ class Outcome:
     ask_human: bool = False
     demand_stop: bool = False
     script_tree: bool = False
+    guard_timeout: bool = False
 
 
 def strip_injection(text: str) -> str:
@@ -237,6 +238,8 @@ async def run_session(
     require_guardian: bool = False,
     llm_clock: Callable[[], float] | None = None,
     prior_silence: int = 0,
+    guard_judge: Callable[[str], list[str]] | None = None,
+    guard_clock: Callable[[], float] | None = None,
 ) -> Outcome:
     started = time.perf_counter()
     recognizer = asr or MockAsr()
@@ -374,7 +377,9 @@ async def run_session(
     if model_say and knowledge is not None:
         reply = f"{reply}{model_say}"
     reply = confine_to_knowledge(reply, opening, knowledge, mandatory)
-    guarded, hits, guard_action = guard_assistant_text(reply, prior_hits=0)
+    reviewed = review_assistant_text(reply, prior_hits=0, judge=guard_judge, clock=guard_clock)
+    guarded, hits, guard_action = reviewed.text, reviewed.hits, reviewed.action
+    guard_timeout = reviewed.timed_out
     for line in mandatory:
         if line not in guarded:
             guarded = f"{line}{guarded}"
@@ -430,4 +435,5 @@ async def run_session(
         ask_human=ask_human,
         demand_stop=demand_stop,
         script_tree=script_tree,
+        guard_timeout=guard_timeout,
     )
