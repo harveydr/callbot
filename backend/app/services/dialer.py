@@ -34,7 +34,7 @@ from app.services.number_health import refresh_caller_health
 from app.services.ops_alerts import record_voice
 from app.services.tokens import TokenBucket
 from app.voice.circuit import CircuitPort, SharedVendorCircuit
-from app.voice.orchestrator import Frame, run_session
+from app.voice.orchestrator import caller_frames, run_session
 from app.voice.stereo import EXPLICIT_LABEL, label_meta, write_recording
 
 EXPLICIT_AIGC = EXPLICIT_LABEL
@@ -133,6 +133,7 @@ async def dial_pending(
     llm_mode: str = "ok",
     guard_judge: Callable[[str], list[str]] | None = None,
     guard_clock: Callable[[], float] | None = None,
+    prior_silence: int = 0,
 ) -> int:
     """Dial pending tasks up to the live concurrency limit. Returns calls created."""
     if campaign.status != "running":
@@ -205,6 +206,7 @@ async def dial_pending(
                     llm_mode,
                     guard_judge,
                     guard_clock,
+                    prior_silence,
                 )
             except Exception:
                 task.status = "failed"
@@ -481,9 +483,10 @@ async def _place(
     llm_mode: str = "ok",
     guard_judge: Callable[[str], list[str]] | None = None,
     guard_clock: Callable[[], float] | None = None,
+    prior_silence: int = 0,
 ) -> None:
-    frames = [] if heard == "无人接听" else [Frame("caller", f"PCM:{heard}".encode("utf-8"))]
     script = await load_template_script(session, redis, campaign.template_id)
+    frames = caller_frames(heard, script)
     asr_circuit = SharedVendorCircuit(settings.redis_url, "asr")
     tts_circuit = SharedVendorCircuit(settings.redis_url, "tts")
     llm_circuit = SharedVendorCircuit(settings.redis_url, "llm")
@@ -500,6 +503,7 @@ async def _place(
             llm_mode=llm_mode,
             guard_judge=guard_judge,
             guard_clock=guard_clock,
+            prior_silence=prior_silence,
         )
         await record_voice(
             redis,

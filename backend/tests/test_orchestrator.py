@@ -30,7 +30,7 @@ from app.services.dialer import dial_pending
 from tests.test_dispatch import _world
 from app.voice.asr import MockAsr
 from app.voice.circuit import SharedVendorCircuit, VendorCircuit
-from app.voice.orchestrator import Frame, run_session
+from app.voice.orchestrator import Frame, caller_frames, run_session
 from app.voice.script import confine_to_knowledge
 from app.voice.tts import MockTts
 
@@ -758,6 +758,75 @@ async def test_a_slow_second_pass_is_kept_and_recorded(
     assert campaign.status == "running"
     assert event is not None and event.detail == {"timeout_ms": 30}
     assert spoken is not None and "必须播报的开场要点。" in spoken and opening_is_complete(spoken)
+
+
+def test_silence_uses_the_node_time_limit() -> None:
+    limited = caller_frames("静音", [{"node_key": "n_open", "content": {"fallback_after_ms": 4000}}])
+    unset = caller_frames("静音", [{"node_key": "n_open", "content": {"text": "要点"}}])
+    assert limited[0].duration_ms == 4000
+    assert limited[0].pcm == b"SILENCE"
+    assert unset[0].duration_ms == 1
+    assert caller_frames("无人接听", None) == []
+    assert caller_frames("好的", None)[0].pcm == "PCM:好的".encode("utf-8")
+
+
+async def test_a_silent_dial_clarifies_once_and_then_says_goodbye(
+    session_factory: async_sessionmaker[AsyncSession], redis_client
+) -> None:
+    settings = load_settings()
+    async with session_factory() as session:
+        await set_bypass(session)
+        tenant, trunk, campaign, contact, _caller = await _world(session, "silence-dial", phone="13800006785")
+        session.add(Task(tenant_id=tenant.id, campaign_id=campaign.id, contact_id=contact.id, attempt_no=1, status="pending"))
+        await session.flush()
+        started = await dial_pending(
+            session,
+            campaign=campaign,
+            tenant=tenant,
+            trunk=trunk,
+            settings=settings,
+            redis=redis_client,
+            now=NOW,
+            heard="静音",
+            llm_mode="down",
+        )
+        call = await session.scalar(select(Call).where(Call.contact_id == contact.id))
+        spoken = await session.scalar(select(CallTurn.text_content).where(CallTurn.speaker == "assistant"))
+    assert started == 1
+    assert campaign.status == "running"
+    assert call is not None and call.status == "completed"
+    assert spoken is not None
+    assert "没有听清" in spoken
+    assert "标准流程" not in spoken
+    assert "必须播报的开场要点。" in spoken
+    assert opening_is_complete(spoken)
+
+    async with session_factory() as session:
+        await set_bypass(session)
+        tenant, trunk, campaign, contact, _caller = await _world(session, "silence-bye", phone="13800006786")
+        session.add(Task(tenant_id=tenant.id, campaign_id=campaign.id, contact_id=contact.id, attempt_no=1, status="pending"))
+        await session.flush()
+        started = await dial_pending(
+            session,
+            campaign=campaign,
+            tenant=tenant,
+            trunk=trunk,
+            settings=settings,
+            redis=redis_client,
+            now=NOW,
+            heard="静音",
+            llm_mode="down",
+            prior_silence=1,
+        )
+        spoken = await session.scalar(select(CallTurn.text_content).where(CallTurn.speaker == "assistant"))
+        call = await session.scalar(select(Call).where(Call.contact_id == contact.id))
+    assert started == 1
+    assert spoken is not None
+    assert "不打扰" in spoken
+    assert "没有听清" not in spoken
+    assert "标准流程" not in spoken
+    assert opening_is_complete(spoken)
+    assert call is not None and call.status == "completed"
 
 
 async def test_a_format_error_is_stored_on_the_call(

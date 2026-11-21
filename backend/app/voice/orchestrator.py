@@ -171,6 +171,16 @@ def _fallback_ms(script: list[dict[str, object]] | None) -> int:
     return 0
 
 
+def caller_frames(heard: str, script: list[dict[str, object]] | None) -> list[Frame]:
+    """Map a dial result to media frames. Silence lasts for the node's own time limit."""
+    if heard == "无人接听":
+        return []
+    if heard == "静音":
+        timeout = _fallback_ms(script)
+        return [Frame("caller", b"SILENCE", duration_ms=timeout if timeout > 0 else 1)]
+    return [Frame("caller", f"PCM:{heard}".encode("utf-8"))]
+
+
 def _node_text(script: list[dict[str, object]] | None, key: str) -> str:
     for item in script or []:
         if item.get("node_key") != key and item.get("id") != key:
