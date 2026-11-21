@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from app.compliance.guardian import guardian_line
 
 _SCOPE_LINE = "这个问题不在本次说明范围内，我让同事回电给您。"
-_CLAIM = re.compile(r"\d+(?:\.\d+)?\s*元|价格|费用|收费|合同|条款|保修|退款|自动续费")
+_NUM = r"(?:\d+(?:\.\d+)?|[零〇一二三四五六七八九十百千万两点]{1,12})"
+_CLAIM = re.compile(rf"(?<!第){_NUM}\s*(?:元|块钱|块|毛|角)|价格|费用|收费|合同|条款|保修|退款|自动续费")
 
 
 @dataclass(frozen=True)

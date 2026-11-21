@@ -112,6 +112,8 @@ def _payloads(llm_mode: str, heard: str) -> list[str]:
         return [json.dumps({"intent": "agree", "say": "我们保证收益", "skip_compliance": True}, ensure_ascii=False)]
     if llm_mode == "priced":
         return [json.dumps({"intent": "inquiry", "say": "费用是 99 元，合同自动续费。"}, ensure_ascii=False)]
+    if llm_mode == "colloquial":
+        return [json.dumps({"intent": "inquiry", "say": "一共九十九块。"}, ensure_ascii=False)]
     return [json.dumps({"intent": classify_intent(heard)}, ensure_ascii=False)]
 
 
@@ -298,7 +300,7 @@ async def run_session(
             else:
                 intent = "inquiry" if llm_mode != "ok" else classify_intent(heard)
             say = parsed.get("say") if parsed is not None else None
-            if llm_mode == "priced" and isinstance(say, str):
+            if llm_mode in {"priced", "colloquial"} and isinstance(say, str):
                 model_say = say
         confidence = 0.5 if format_error else _confidence(parsed)
         llm_first_token_ms = (clock() - llm_started) * 1000

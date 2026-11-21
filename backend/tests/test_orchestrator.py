@@ -31,6 +31,7 @@ from tests.test_dispatch import _world
 from app.voice.asr import MockAsr
 from app.voice.circuit import VendorCircuit
 from app.voice.orchestrator import Frame, run_session
+from app.voice.script import confine_to_knowledge
 from app.voice.tts import MockTts
 
 NOW = datetime(2026, 11, 22, 2, 0, tzinfo=timezone.utc)
@@ -399,6 +400,17 @@ def _priced_script(knowledge: str) -> list[dict[str, object]]:
     ]
 
 
+def test_a_colloquial_amount_is_a_price_claim() -> None:
+    opening = "开场。"
+    refused = confine_to_knowledge(f"{opening}只要99块，外加两块钱。", opening, "本次只通知时间。", ["必须播报。"])
+    plain = confine_to_knowledge(f"{opening}请到第一单元。", opening, "本次只通知时间。", [])
+    assert "99块" not in refused
+    assert "两块钱" not in refused
+    assert "必须播报。" in refused
+    assert "不在本次说明范围内" in refused
+    assert plain == f"{opening}请到第一单元。"
+
+
 async def test_a_free_answer_cannot_leave_the_node_knowledge() -> None:
     refused = await run_session(
         [Frame("caller", "PCM:请问一下".encode("utf-8"))],
@@ -421,6 +433,24 @@ async def test_a_free_answer_cannot_leave_the_node_knowledge() -> None:
     assert opening_is_complete(refused.reply_text)
     assert "费用是 99 元，合同自动续费。" in allowed.reply_text
     assert "不在本次说明范围内" not in allowed.reply_text
+    spoken = await run_session(
+        [Frame("caller", "PCM:请问一下".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        llm_mode="colloquial",
+        script=_priced_script("本次只通知时间。"),
+    )
+    kept = await run_session(
+        [Frame("caller", "PCM:请问一下".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        llm_mode="colloquial",
+        script=_priced_script("一共九十九块。"),
+    )
+    assert "九十九块" not in spoken.reply_text
+    assert "不在本次说明范围内" in spoken.reply_text
+    assert "一共九十九块。" in kept.reply_text
+    assert opening_is_complete(spoken.reply_text)
 
 
 async def test_silence_clarifies_once_and_then_says_goodbye() -> None:
