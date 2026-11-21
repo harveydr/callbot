@@ -177,6 +177,7 @@ async def test_version_conflict_start_idempotent_and_pause(
     async with session_factory() as session:
         await set_bypass(session)
         tenant = await _tenant(session, "dial-co")
+        tenant.max_concurrency = 10
         await _user(session, role="operator", username="dial-op", tenant=tenant)
         template = ScenarioTemplate(
             tenant_id=tenant.id,

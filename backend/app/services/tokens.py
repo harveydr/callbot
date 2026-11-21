@@ -48,6 +48,20 @@ class TokenBucket:
         result = await cast(Any, self._client.eval(self._script_release(), 1, self._key(name)))
         return int(result)
 
+    async def acquire_all(self, layers: list[tuple[str, int]], *, ttl_sec: int) -> bool:
+        """Take every layer or none. A failed layer rolls back the ones already held."""
+        held: list[str] = []
+        for name, limit in layers:
+            if not await self.acquire(name, limit=limit, ttl_sec=ttl_sec):
+                await self.release_all(held)
+                return False
+            held.append(name)
+        return True
+
+    async def release_all(self, names: list[str]) -> None:
+        for name in names:
+            await self.release(name)
+
     @staticmethod
     def _script_acquire() -> str:
         return _ACQUIRE

@@ -52,7 +52,7 @@ class Tenant(Base):
     allowed_scenarios: Mapped[list[str]] = mapped_column(
         ARRAY(Text), nullable=False, server_default=text("'{}'::text[]")
     )
-    max_concurrency: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("2"))
+    max_concurrency: Mapped[int] = mapped_column(Integer, nullable=False, default=2, server_default=text("2"))
     daily_call_quota: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("200"))
     billing_budget: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
     compliance_mode: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'strict'"))
@@ -137,7 +137,7 @@ class Trunk(Base):
     sip_transport: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'udp'"))
     auth_user: Mapped[str | None] = mapped_column(Text)
     auth_credential_enc: Mapped[bytes | None] = mapped_column(LargeBinary)
-    max_concurrency: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("5"))
+    max_concurrency: Mapped[int] = mapped_column(Integer, nullable=False, default=5, server_default=text("5"))
     allowed_scenarios: Mapped[list[str]] = mapped_column(
         ARRAY(Text), nullable=False, server_default=text("'{}'::text[]")
     )
@@ -268,7 +268,7 @@ class Campaign(Base):
     end_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     call_window: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'09:00-19:00'"))
     timezone: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'Asia/Shanghai'"))
-    max_concurrency: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("2"))
+    max_concurrency: Mapped[int] = mapped_column(Integer, nullable=False, default=2, server_default=text("2"))
     freq_per_phone_daily: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
     freq_per_phone_7d: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("3"))
     freq_per_phone_30d: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("6"))

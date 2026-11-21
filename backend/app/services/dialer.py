@@ -38,6 +38,16 @@ from app.voice.stereo import EXPLICIT_LABEL, label_meta, write_recording
 EXPLICIT_AIGC = EXPLICIT_LABEL
 _RETRYABLE = ("no_answer", "busy")
 _REJECTED_HEARD = frozenset({"拒接", "用户拒接"})
+_TOKEN_TTL_SEC = 7200
+
+
+def concurrency_layers(tenant: Tenant, trunk: Trunk, campaign: Campaign) -> list[tuple[str, int]]:
+    """Live caps named by the PRD: tenant and trunk, plus the campaign's own cap."""
+    return [
+        (f"tenant:{tenant.id}:conc", tenant.max_concurrency),
+        (f"trunk:{trunk.id}:conc", trunk.max_concurrency),
+        (f"campaign:{campaign.id}:conc", campaign.max_concurrency),
+    ]
 
 
 def _retry_delay(policy: dict[str, object], existing_attempts: int) -> timedelta:
@@ -126,8 +136,71 @@ async def dial_pending(
     await apply_qualification_clock(session, tenant, moment)
     bucket = TokenBucket(redis, prefix="")
     flags = Flags(settings.calling_enabled, settings.feature_telesales, settings.feature_collection)
-    tasks = (
-        await session.scalars(
+    layers = concurrency_layers(tenant, trunk, campaign)
+    names = [name for name, _limit in layers]
+    limit = min(cap for _name, cap in layers)
+    started = 0
+    while started < limit and campaign.status == "running":
+        if await apply_billing_budget(session, tenant, moment):
+            break
+        if not await bucket.acquire_all(layers, ttl_sec=_TOKEN_TTL_SEC):
+            break
+        try:
+            task = await _claim_task(session, campaign, moment)
+            if task is None:
+                break
+            contact = await session.scalar(select(Contact).where(Contact.id == task.contact_id))
+            if contact is None or contact.deleted_at is not None:
+                task.status = "skipped"
+                continue
+            decision = await pre_dial_gate(
+                session,
+                tenant=TenantView(
+                    tenant.id,
+                    tenant.status,
+                    list(tenant.allowed_scenarios),
+                    tenant.timezone,
+                    tenant.daily_call_quota,
+                ),
+                trunk=TrunkView(trunk.mode, trunk.status, list(trunk.allowed_scenarios)),
+                campaign=CampaignView(
+                    campaign.scenario_code,
+                    campaign.call_window,
+                    campaign.timezone,
+                    campaign.freq_per_phone_daily,
+                    campaign.freq_per_phone_7d,
+                    campaign.freq_per_phone_30d,
+                ),
+                phone_hash=contact.phone_hash,
+                now=moment,
+                flags=flags,
+                minor=contact.minor,
+                template_id=campaign.template_id,
+            )
+            if not decision.allowed:
+                await _blocked(session, campaign, contact, task, decision.code or "", decision.block_reason or "", moment)
+                continue
+            caller = await _active_caller(session, campaign)
+            if campaign.caller_number_id is not None and caller is None:
+                await _blocked(session, campaign, contact, task, "COMPLIANCE_SCENARIO_NOT_ALLOWED", "caller_blocked", moment)
+                continue
+            try:
+                await _place(session, campaign, tenant, contact, task, settings, redis, moment, heard, caller)
+            except Exception:
+                task.status = "failed"
+                raise
+            started += 1
+        finally:
+            await bucket.release_all(names)
+    await _pause_if_rejected(session, campaign, moment)
+    return started
+
+
+async def _claim_task(session: AsyncSession, campaign: Campaign, moment: datetime) -> Task | None:
+    """Lock one due task. Another worker's locked row is skipped, not double-dialed."""
+    return cast(
+        Task | None,
+        await session.scalar(
             select(Task)
             .where(
                 Task.campaign_id == campaign.id,
@@ -135,64 +208,10 @@ async def dial_pending(
                 or_(Task.next_run_at.is_(None), Task.next_run_at <= moment),
             )
             .order_by(Task.created_at, Task.attempt_no)
-        )
-    ).all()
-    started = 0
-    for task in tasks:
-        if await apply_billing_budget(session, tenant, moment):
-            break
-        if started >= campaign.max_concurrency:
-            break
-        contact = await session.scalar(select(Contact).where(Contact.id == task.contact_id))
-        if contact is None or contact.deleted_at is not None:
-            task.status = "skipped"
-            continue
-        decision = await pre_dial_gate(
-            session,
-            tenant=TenantView(
-                tenant.id,
-                tenant.status,
-                list(tenant.allowed_scenarios),
-                tenant.timezone,
-                tenant.daily_call_quota,
-            ),
-            trunk=TrunkView(trunk.mode, trunk.status, list(trunk.allowed_scenarios)),
-            campaign=CampaignView(
-                campaign.scenario_code,
-                campaign.call_window,
-                campaign.timezone,
-                campaign.freq_per_phone_daily,
-                campaign.freq_per_phone_7d,
-                campaign.freq_per_phone_30d,
-            ),
-            phone_hash=contact.phone_hash,
-            now=moment,
-            flags=flags,
-            minor=contact.minor,
-            template_id=campaign.template_id,
-        )
-        if not decision.allowed:
-            await _blocked(session, campaign, contact, task, decision.code or "", decision.block_reason or "", moment)
-            continue
-        caller = await _active_caller(session, campaign)
-        if campaign.caller_number_id is not None and caller is None:
-            await _blocked(session, campaign, contact, task, "COMPLIANCE_SCENARIO_NOT_ALLOWED", "caller_blocked", moment)
-            continue
-        held = await bucket.acquire(f"live:{tenant.id}", limit=campaign.max_concurrency, ttl_sec=120)
-        if not held:
-            break
-        try:
-            await _place(session, campaign, tenant, contact, task, settings, redis, moment, heard, caller)
-        except Exception:
-            task.status = "failed"
-            raise
-        started += 1
-        if campaign.status != "running":
-            break
-    for _ in range(started):
-        await bucket.release(f"live:{tenant.id}")
-    await _pause_if_rejected(session, campaign, moment)
-    return started
+            .limit(1)
+            .with_for_update(skip_locked=True)
+        ),
+    )
 
 
 async def schedule_retries(session: AsyncSession, campaign: Campaign, now: datetime) -> int:
