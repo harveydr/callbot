@@ -34,6 +34,7 @@ class Frame:
     channel: str
     pcm: bytes
     dropped: bool = False
+    duration_ms: int = 0
 
 
 @dataclass
@@ -112,6 +113,38 @@ def _payloads(llm_mode: str, heard: str) -> list[str]:
     if llm_mode == "priced":
         return [json.dumps({"intent": "inquiry", "say": "费用是 99 元，合同自动续费。"}, ensure_ascii=False)]
     return [json.dumps({"intent": classify_intent(heard)}, ensure_ascii=False)]
+
+
+def _fallback_ms(script: list[dict[str, object]] | None) -> int:
+    """How long to wait before a silence counts. Zero means the script did not set one."""
+    items = script or []
+    by_key: dict[str, dict[str, object]] = {}
+    for item in items:
+        key = item.get("node_key") or item.get("id")
+        if isinstance(key, str) and key:
+            by_key[key] = item
+    current: dict[str, object] | None = by_key.get("n_open") or (items[0] if items else None)
+    seen: set[str] = set()
+    while isinstance(current, dict):
+        key = current.get("node_key") or current.get("id") or ""
+        if not isinstance(key, str) or key in seen:
+            break
+        seen.add(key)
+        content = current.get("content")
+        if not isinstance(content, dict):
+            break
+        raw = content.get("fallback_after_ms")
+        if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+            return raw
+        nxt = content.get("next")
+        if isinstance(nxt, list):
+            nxt = next((item for item in nxt if isinstance(item, str)), None)
+        if not isinstance(nxt, str):
+            routes = content.get("routes")
+            route_next = routes.get("next") if isinstance(routes, dict) else None
+            nxt = route_next if isinstance(route_next, str) else None
+        current = by_key.get(nxt) if isinstance(nxt, str) else None
+    return 0
 
 
 def _node_text(script: list[dict[str, object]] | None, key: str) -> str:
@@ -195,6 +228,7 @@ async def run_session(
     tts_down = await _speak(speaker, tts_circuit, opening)
     heard_parts: list[str] = []
     silence_frames = 0
+    silence_ms = 0
     degraded = tts_down
     asr_attempts = 0
     asr_errors = 0
@@ -213,6 +247,8 @@ async def run_session(
             continue
         if not vad.is_speech(frame.pcm):
             silence_frames += 1
+            if frame.duration_ms > 0:
+                silence_ms += frame.duration_ms
             continue
         text, used_fallback, attempted, failed = await _asr_text(recognizer, circuit, frame.pcm)
         if attempted:
@@ -223,17 +259,20 @@ async def run_session(
         if text:
             heard_parts.append(text)
     heard = strip_injection("".join(heard_parts))
-    no_input = silence_frames > 0 and not heard
+    timeout_ms = _fallback_ms(script)
+    silent = silence_frames > 0 and not heard
+    no_input = silent and silence_ms >= timeout_ms
+    hold = silent and not no_input
     clock = llm_clock or time.perf_counter
     llm_started = clock()
-    if llm_mode == "down" and not no_input:
+    if llm_mode == "down" and not no_input and not hold:
         llm_circuit.observe(503)
-    llm_down = False if no_input else not llm_circuit.allow_vendor()
+    llm_down = False if no_input or hold else not llm_circuit.allow_vendor()
     llm_first_token_ms: float | None = None
     model_say = ""
     format_error = False
     confidence = 0.5
-    if no_input:
+    if no_input or hold:
         intent = "invalid"
     elif llm_down:
         intent = classify_intent(heard)

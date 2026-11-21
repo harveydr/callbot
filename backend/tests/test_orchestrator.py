@@ -437,17 +437,25 @@ async def test_silence_clarifies_once_and_then_says_goodbye() -> None:
         },
     ]
     first = await run_session(
-        [Frame("caller", b"SILENCE")],
+        [Frame("caller", b"SILENCE", duration_ms=4000)],
         company="回声",
         purpose="通知",
         script=script,
     )
     second = await run_session(
-        [Frame("caller", b"SILENCE")],
+        [Frame("caller", b"SILENCE", duration_ms=4000)],
         company="回声",
         purpose="通知",
         script=script,
         prior_silence=1,
+    )
+    early = await run_session(
+        [Frame("caller", b"SILENCE", duration_ms=3999)],
+        company="回声",
+        purpose="通知",
+        script=script,
+        prior_silence=1,
+        llm_mode="down",
     )
     assert first.action == "speak"
     assert "没有听清" in first.reply_text
@@ -457,6 +465,11 @@ async def test_silence_clarifies_once_and_then_says_goodbye() -> None:
     assert second.reply_text.endswith("不再打扰。")
     assert "没有听清" not in second.reply_text
     assert opening_is_complete(second.reply_text)
+    assert early.action == "speak"
+    assert "没有听清" not in early.reply_text
+    assert "不再打扰" not in early.reply_text
+    assert "标准流程" not in early.reply_text
+    assert opening_is_complete(early.reply_text)
 
 
 async def test_a_slow_model_plays_the_filler_after_the_opening() -> None:
