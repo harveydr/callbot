@@ -15,7 +15,8 @@ from app.models.extra import CallTurn, NumberHealthStat, ScriptNode
 from app.security.crypto import encrypt_phone, phone_hash
 from app.security.passwords import hash_password
 from app.services.control import open_complaint
-from app.services.dialer import dial_pending, schedule_retries
+from app.services.dialer import dial_pending, dispatch_due, schedule_retries
+from app.tasks import celery_app
 
 NOW = datetime(2026, 11, 22, 2, 0, tzinfo=timezone.utc)
 
@@ -137,6 +138,103 @@ async def test_script_and_caller_are_used(session_factory: async_sessionmaker[As
         assert spoken is not None and "必须播报的开场要点。" in spoken and "为您转接人工。" in spoken
         assert callback is not None and callback.next_run_at == NOW + timedelta(minutes=30)
         assert health is not None and health.answer_rate == 0
+
+
+async def test_future_callback_waits_until_it_is_due(
+    session_factory: async_sessionmaker[AsyncSession], redis_client
+) -> None:
+    settings = load_settings()
+    async with session_factory() as session:
+        await set_bypass(session)
+        tenant, trunk, campaign, contact, _caller = await _world(session, "dispatch-wait", phone="13800005556")
+        session.add(
+            Task(
+                tenant_id=tenant.id,
+                campaign_id=campaign.id,
+                contact_id=contact.id,
+                attempt_no=1,
+                status="pending",
+                next_run_at=NOW + timedelta(minutes=30),
+            )
+        )
+        await session.flush()
+        early = await dial_pending(
+            session, campaign=campaign, tenant=tenant, trunk=trunk, settings=settings, redis=redis_client, now=NOW
+        )
+        waiting = await session.scalar(select(Task).where(Task.campaign_id == campaign.id))
+        assert early == 0
+        assert waiting is not None and waiting.status == "pending"
+        started = await dial_pending(
+            session,
+            campaign=campaign,
+            tenant=tenant,
+            trunk=trunk,
+            settings=settings,
+            redis=redis_client,
+            now=NOW + timedelta(minutes=30),
+        )
+        assert started == 1
+
+
+async def test_dispatch_due_skips_paused_campaigns_and_future_tasks(
+    session_factory: async_sessionmaker[AsyncSession], redis_client
+) -> None:
+    settings = load_settings()
+    async with session_factory() as session:
+        await set_bypass(session)
+        due_tenant, _trunk, due_campaign, due_contact, _caller = await _world(session, "dispatch-due", phone="13800005557")
+        paused_tenant, _paused_trunk, paused, paused_contact, _paused_caller = await _world(
+            session, "dispatch-paused", phone="13800005558"
+        )
+        future_tenant, _future_trunk, future, future_contact, _future_caller = await _world(
+            session, "dispatch-future", phone="13800005559"
+        )
+        paused.status = "paused"
+        session.add_all(
+            [
+                Task(
+                    tenant_id=due_tenant.id,
+                    campaign_id=due_campaign.id,
+                    contact_id=due_contact.id,
+                    attempt_no=1,
+                    status="pending",
+                    next_run_at=NOW,
+                ),
+                Task(
+                    tenant_id=paused_tenant.id,
+                    campaign_id=paused.id,
+                    contact_id=paused_contact.id,
+                    attempt_no=1,
+                    status="pending",
+                    next_run_at=NOW,
+                ),
+                Task(
+                    tenant_id=future_tenant.id,
+                    campaign_id=future.id,
+                    contact_id=future_contact.id,
+                    attempt_no=1,
+                    status="pending",
+                    next_run_at=NOW + timedelta(minutes=30),
+                ),
+            ]
+        )
+        await session.flush()
+        started = await dispatch_due(session, settings=settings, redis=redis_client, now=NOW)
+        paused_task = await session.scalar(select(Task).where(Task.campaign_id == paused.id))
+        future_task = await session.scalar(select(Task).where(Task.campaign_id == future.id))
+        due_call = await session.scalar(select(Call).where(Call.campaign_id == due_campaign.id))
+        assert started == 1
+        assert paused_task is not None and paused_task.status == "pending"
+        assert future_task is not None and future_task.status == "pending"
+        assert due_call is not None
+
+
+def test_due_dispatch_runs_every_minute() -> None:
+    entry = celery_app.conf.beat_schedule["dispatch-due-campaigns"]
+    assert entry["task"] == "dispatch_due_campaigns"
+    assert entry["schedule"] == timedelta(minutes=1)
+    assert celery_app.conf.task_annotations["dispatch_due_campaigns"]["time_limit"] == 60
+    assert celery_app.conf.task_routes["dispatch_due_campaigns"]["queue"] == "dispatch"
 
 
 async def test_blocked_caller_is_not_dialed(session_factory: async_sessionmaker[AsyncSession], redis_client) -> None:

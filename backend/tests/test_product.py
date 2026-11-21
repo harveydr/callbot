@@ -390,8 +390,10 @@ async def test_retries_follow_policy_and_token_ttl(session_factory: async_sessio
         campaign.retry_policy = {"max_retry": 1, "interval_min": [60]}
         created = await schedule_retries(session, campaign, NOW)
         created_again = await schedule_retries(session, campaign, NOW)
+        follow = await session.scalar(select(Task).where(Task.campaign_id == campaign.id, Task.attempt_no == 2))
         assert created == 1
         assert created_again == 0
+        assert follow is not None and follow.next_run_at == NOW + timedelta(minutes=60)
 
 
 async def test_body_cannot_set_tenant_and_routes_exist(client: AsyncClient) -> None:

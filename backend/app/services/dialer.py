@@ -9,7 +9,7 @@ from typing import cast
 from zoneinfo import ZoneInfo
 
 import redis.asyncio as redis_async
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.compliance.gate_pre import CampaignView, Flags, TenantView, TrunkView, pre_dial_gate
@@ -38,6 +38,22 @@ from app.voice.stereo import EXPLICIT_LABEL, label_meta, write_recording
 EXPLICIT_AIGC = EXPLICIT_LABEL
 _RETRYABLE = ("no_answer", "busy")
 _REJECTED_HEARD = frozenset({"拒接", "用户拒接"})
+
+
+def _retry_delay(policy: dict[str, object], existing_attempts: int) -> timedelta:
+    """Minutes from retry_policy.interval_min. The first retry uses the first entry."""
+    raw = policy.get("interval_min")
+    minutes = 60
+    if isinstance(raw, list) and raw:
+        index = min(max(existing_attempts - 1, 0), len(raw) - 1)
+        chosen = raw[index]
+        if isinstance(chosen, int) and not isinstance(chosen, bool):
+            minutes = chosen
+        elif isinstance(chosen, str) and chosen.isdigit():
+            minutes = int(chosen)
+    if minutes < 0:
+        minutes = 0
+    return timedelta(minutes=minutes)
 _REJECT_SAMPLE = 5
 _REJECT_RATE = 0.85
 
@@ -113,7 +129,11 @@ async def dial_pending(
     tasks = (
         await session.scalars(
             select(Task)
-            .where(Task.campaign_id == campaign.id, Task.status == "pending")
+            .where(
+                Task.campaign_id == campaign.id,
+                Task.status == "pending",
+                or_(Task.next_run_at.is_(None), Task.next_run_at <= moment),
+            )
             .order_by(Task.created_at, Task.attempt_no)
         )
     ).all()
@@ -193,12 +213,71 @@ async def schedule_retries(session: AsyncSession, campaign: Campaign, now: datet
                 contact_id=call.contact_id,
                 attempt_no=len(attempts) + 1,
                 status="pending",
-                next_run_at=_aware(now),
+                next_run_at=_aware(now) + _retry_delay(campaign.retry_policy, len(attempts)),
             )
         )
         created += 1
     await session.flush()
     return created
+
+
+async def dispatch_campaign_due(
+    session: AsyncSession,
+    *,
+    campaign_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    settings: Settings,
+    redis: redis_async.Redis,
+    now: datetime,
+    heard: str = "好的",
+) -> int:
+    """Create interval retries, then dial tasks whose next_run_at has arrived."""
+    campaign = await session.scalar(
+        select(Campaign).where(Campaign.id == campaign_id, Campaign.tenant_id == tenant_id)
+    )
+    if campaign is None or campaign.status != "running":
+        return 0
+    tenant = await session.scalar(select(Tenant).where(Tenant.id == tenant_id))
+    trunk = await session.scalar(select(Trunk).where(Trunk.id == campaign.trunk_id))
+    if tenant is None or trunk is None:
+        return 0
+    moment = _aware(now)
+    await schedule_retries(session, campaign, moment)
+    return await dial_pending(
+        session,
+        campaign=campaign,
+        tenant=tenant,
+        trunk=trunk,
+        settings=settings,
+        redis=redis,
+        now=moment,
+        heard=heard,
+    )
+
+
+async def dispatch_due(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    redis: redis_async.Redis,
+    now: datetime,
+    heard: str = "好的",
+) -> int:
+    """Walk running campaigns. Paused, aborted, and not-yet-due tasks stay put."""
+    moment = _aware(now)
+    campaigns = (await session.scalars(select(Campaign).where(Campaign.status == "running"))).all()
+    started = 0
+    for campaign in campaigns:
+        started += await dispatch_campaign_due(
+            session,
+            campaign_id=campaign.id,
+            tenant_id=campaign.tenant_id,
+            settings=settings,
+            redis=redis,
+            now=moment,
+            heard=heard,
+        )
+    return started
 
 
 async def _handoff(
