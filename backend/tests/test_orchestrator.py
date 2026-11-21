@@ -153,6 +153,11 @@ async def test_bad_json_and_prompt_injection_do_not_skip_the_opening() -> None:
     assert opening_is_complete(hostile.reply_text)
     assert "保证收益" not in hostile.reply_text
     assert hostile.needs_dnd is False
+    assert hostile.demand_stop is False
+    assert hostile.ask_human is False
+    assert hostile.action == "speak"
+    assert "不再来电" not in hostile.reply_text
+    assert "转接" not in hostile.reply_text
 
 
 async def test_jitter_drop_does_not_crash() -> None:
@@ -544,6 +549,73 @@ async def test_asr_429_does_not_open_tts_or_llm() -> None:
     assert asr_circuit.open is True
     assert tts_circuit.open is False
     assert llm_circuit.open is False
+
+
+async def test_model_stop_and_human_flags_drive_the_call() -> None:
+    stopped = await run_session(
+        [Frame("caller", "PCM:请勿再来电".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        llm_mode="flagged_stop",
+    )
+    human = await run_session(
+        [Frame("caller", "PCM:找负责人".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        llm_mode="flagged_human",
+    )
+    quoted = await run_session(
+        [Frame("caller", "PCM:请勿再来电".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        llm_mode="flagged_text",
+    )
+    assert stopped.demand_stop is True
+    assert stopped.needs_dnd is True
+    assert stopped.action == "hangup"
+    assert stopped.intent == "inquiry"
+    assert "已为您登记不再来电" in stopped.reply_text
+    assert opening_is_complete(stopped.reply_text)
+    assert human.ask_human is True
+    assert human.demand_stop is False
+    assert human.needs_dnd is False
+    assert human.action == "transfer"
+    assert "转接人工同事" in human.reply_text
+    assert opening_is_complete(human.reply_text)
+    assert quoted.demand_stop is False
+    assert quoted.ask_human is False
+    assert quoted.needs_dnd is False
+    assert quoted.action == "speak"
+
+
+async def test_a_model_stop_flag_writes_dnd_without_a_keyword(
+    session_factory: async_sessionmaker[AsyncSession], redis_client
+) -> None:
+    settings = load_settings()
+    phone = "13800006782"
+    async with session_factory() as session:
+        await set_bypass(session)
+        tenant, trunk, campaign, contact, _caller = await _world(session, "model-stop", phone=phone)
+        session.add(Task(tenant_id=tenant.id, campaign_id=campaign.id, contact_id=contact.id, attempt_no=1, status="pending"))
+        await session.flush()
+        started = await dial_pending(
+            session,
+            campaign=campaign,
+            tenant=tenant,
+            trunk=trunk,
+            settings=settings,
+            redis=redis_client,
+            now=NOW,
+            heard="请勿再来电",
+            llm_mode="flagged_stop",
+        )
+        await session.commit()
+        await set_bypass(session)
+        row = await session.scalar(select(DndEntry).where(DndEntry.tenant_id == tenant.id, DndEntry.phone_hash == contact.phone_hash))
+        call = await session.scalar(select(Call).where(Call.contact_id == contact.id))
+    assert started == 1
+    assert row is not None and row.source == "user_said_no"
+    assert call is not None and call.status == "completed"
 
 
 async def test_a_format_error_is_stored_on_the_call(

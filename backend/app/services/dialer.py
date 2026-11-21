@@ -544,6 +544,7 @@ async def _place(
             company=tenant.name,
             purpose=campaign.name,
             opening_played=True,
+            model_demand_stop=outcome.demand_stop,
         )
         if in_call.dnd_written:
             await remember_dnd(redis, tenant_id=campaign.tenant_id, phone_hash=contact.phone_hash)

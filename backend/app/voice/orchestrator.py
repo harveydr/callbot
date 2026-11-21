@@ -26,6 +26,8 @@ _FILLER_AFTER_MS = 400.0
 _CLARIFY = "您好，我没有听清，方便的话请再说一次。"
 _FORMAT_CLARIFY = "不好意思，我再确认一下您的意思。"
 _BYE = "那先不打扰您了。"
+_STOP_CONFIRM = "好的，已为您登记不再来电，本次通话就到这里。"
+_HUMAN_LINE = "我为您转接人工同事。"
 _INTENTS = {"agree", "refuse", "hesitate", "inquiry", "complaint", "invalid"}
 
 
@@ -61,6 +63,8 @@ class Outcome:
     channels: dict[str, str] = field(default_factory=dict)
     llm_format_error: bool = False
     intent_confidence: float = 0.5
+    ask_human: bool = False
+    demand_stop: bool = False
 
 
 def strip_injection(text: str) -> str:
@@ -109,11 +113,22 @@ def _payloads(llm_mode: str, heard: str) -> list[str]:
     if llm_mode == "bare":
         return [json.dumps({"intent": "agree"}, ensure_ascii=False)]
     if llm_mode == "hostile":
-        return [json.dumps({"intent": "agree", "say": "我们保证收益", "skip_compliance": True}, ensure_ascii=False)]
+        return [
+            json.dumps(
+                {"intent": "agree", "say": "我们保证收益", "skip_compliance": True, "demand_stop": True, "ask_human": True},
+                ensure_ascii=False,
+            )
+        ]
     if llm_mode == "priced":
         return [json.dumps({"intent": "inquiry", "say": "费用是 99 元，合同自动续费。"}, ensure_ascii=False)]
     if llm_mode == "colloquial":
         return [json.dumps({"intent": "inquiry", "say": "一共九十九块。"}, ensure_ascii=False)]
+    if llm_mode == "flagged_stop":
+        return [json.dumps({"intent": "inquiry", "demand_stop": True}, ensure_ascii=False)]
+    if llm_mode == "flagged_human":
+        return [json.dumps({"intent": "inquiry", "ask_human": True}, ensure_ascii=False)]
+    if llm_mode == "flagged_text":
+        return [json.dumps({"intent": "inquiry", "demand_stop": "true", "ask_human": "true"}, ensure_ascii=False)]
     return [json.dumps({"intent": classify_intent(heard)}, ensure_ascii=False)]
 
 
@@ -274,6 +289,8 @@ async def run_session(
     model_say = ""
     format_error = False
     confidence = 0.5
+    ask_human = False
+    demand_stop = False
     if no_input or hold:
         intent = "invalid"
     elif llm_down:
@@ -302,6 +319,9 @@ async def run_session(
             say = parsed.get("say") if parsed is not None else None
             if llm_mode in {"priced", "colloquial"} and isinstance(say, str):
                 model_say = say
+            if llm_mode != "hostile":
+                ask_human = parsed.get("ask_human") is True if parsed is not None else False
+                demand_stop = parsed.get("demand_stop") is True if parsed is not None else False
         confidence = 0.5 if format_error else _confidence(parsed)
         llm_first_token_ms = (clock() - llm_started) * 1000
     script_body, script_action, mandatory = render_script(
@@ -331,6 +351,14 @@ async def run_session(
     for line in mandatory:
         if line not in guarded:
             guarded = f"{line}{guarded}"
+    if demand_stop:
+        action = "hangup"
+        if _STOP_CONFIRM not in guarded:
+            guarded = f"{guarded}{_STOP_CONFIRM}"
+    elif ask_human and action != "hangup":
+        action = "transfer"
+        if _HUMAN_LINE not in guarded:
+            guarded = f"{guarded}{_HUMAN_LINE}"
     if llm_down and _SCRIPT_MODE not in guarded:
         guarded = f"{opening}{_SCRIPT_MODE}{guarded.removeprefix(opening)}"
     if tts_down:
@@ -361,7 +389,7 @@ async def run_session(
         reply_text=guarded,
         heard=heard,
         redline_hits=hits,
-        needs_dnd=intent == "refuse",
+        needs_dnd=intent == "refuse" or demand_stop,
         circuit_open=circuit.open,
         tts_down=tts_down,
         llm_down=llm_down,
@@ -372,4 +400,6 @@ async def run_session(
         channels=channels,
         llm_format_error=format_error,
         intent_confidence=confidence,
+        ask_human=ask_human,
+        demand_stop=demand_stop,
     )

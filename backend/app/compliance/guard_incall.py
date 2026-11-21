@@ -40,6 +40,7 @@ async def on_caller_text(
     company: str,
     purpose: str,
     opening_played: bool,
+    model_demand_stop: bool = False,
 ) -> InCallDecision:
     spoken_opening = ""
     hits: list[str] = []
@@ -55,7 +56,7 @@ async def on_caller_text(
             )
         )
 
-    if _contains_any(text, _STOP) or _contains_any(text, _COMPLAINT):
+    if _contains_any(text, _STOP) or _contains_any(text, _COMPLAINT) or model_demand_stop:
         session.add(
             DndEntry(
                 tenant_id=tenant_id,
