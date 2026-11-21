@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import redis.asyncio as redis_async
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from app.compliance.offwindow import flag_offwindow_calls
 from app.config import Settings, load_settings
 from app.db import make_engine, make_session_factory, set_bypass
 from app.services.dialer import dispatch_campaign_due, dispatch_due
@@ -46,10 +47,12 @@ async def _run_due() -> str:
     settings, engine, factory, redis = await _open()
     try:
         async with factory() as session:
+            moment = datetime.now(timezone.utc)
             await set_bypass(session)
-            started = await dispatch_due(session, settings=settings, redis=redis, now=datetime.now(timezone.utc))
+            flagged = await flag_offwindow_calls(session, moment)
+            started = await dispatch_due(session, settings=settings, redis=redis, now=moment)
             await session.commit()
-            return f"started:{started}"
+            return f"started:{started} offwindow:{flagged}"
     finally:
         await redis.aclose()
         await engine.dispose()

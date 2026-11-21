@@ -11,7 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.config import load_settings
 from app.db import set_bypass
 from app.models import Call, CallerNumber, Campaign, ConsentRecord, Contact, ContactList, ScenarioTemplate, Task, Tenant, Trunk, User
-from app.models.extra import CallTurn, NumberHealthStat, ScriptNode
+from app.compliance.offwindow import flag_offwindow_calls
+from app.models.extra import Alert, CallTurn, NumberHealthStat, ScriptNode
 from app.security.crypto import encrypt_phone, phone_hash
 from app.security.passwords import hash_password
 from app.services.control import open_complaint
@@ -227,6 +228,71 @@ async def test_dispatch_due_skips_paused_campaigns_and_future_tasks(
         assert paused_task is not None and paused_task.status == "pending"
         assert future_task is not None and future_task.status == "pending"
         assert due_call is not None
+
+
+async def test_a_dial_outside_the_window_raises_one_critical_alert(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    scanned_at = datetime(2026, 11, 22, 5, 0, tzinfo=timezone.utc)
+    async with session_factory() as session:
+        await set_bypass(session)
+        tenant, trunk, campaign, contact, _caller = await _world(session, "offwindow", phone="13800005560")
+        night = Call(
+            tenant_id=tenant.id,
+            campaign_id=campaign.id,
+            contact_id=contact.id,
+            call_uuid=uuid.uuid4(),
+            status="completed",
+            trunk_id=trunk.id,
+            template_version=1,
+            start_at=datetime(2026, 11, 21, 20, 0, tzinfo=timezone.utc),
+        )
+        lunch = Call(
+            tenant_id=tenant.id,
+            campaign_id=campaign.id,
+            contact_id=contact.id,
+            call_uuid=uuid.uuid4(),
+            status="completed",
+            trunk_id=trunk.id,
+            template_version=1,
+            start_at=datetime(2026, 11, 22, 4, 30, tzinfo=timezone.utc),
+        )
+        allowed = Call(
+            tenant_id=tenant.id,
+            campaign_id=campaign.id,
+            contact_id=contact.id,
+            call_uuid=uuid.uuid4(),
+            status="completed",
+            trunk_id=trunk.id,
+            template_version=1,
+            start_at=NOW,
+        )
+        blocked = Call(
+            tenant_id=tenant.id,
+            campaign_id=campaign.id,
+            contact_id=contact.id,
+            call_uuid=uuid.uuid4(),
+            status="blocked_compliance",
+            trunk_id=trunk.id,
+            template_version=1,
+            start_at=datetime(2026, 11, 21, 20, 0, tzinfo=timezone.utc),
+            block_reason="outside_call_window",
+        )
+        session.add_all([night, lunch, allowed, blocked])
+        await session.flush()
+        first = await flag_offwindow_calls(session, scanned_at)
+        second = await flag_offwindow_calls(session, scanned_at)
+        alerts = (
+            await session.scalars(select(Alert).where(Alert.tenant_id == tenant.id, Alert.code == "offwindow_call"))
+        ).all()
+        messages = {row.message for row in alerts}
+        assert first == 2
+        assert second == 0
+        assert len(alerts) == 2
+        assert all(row.severity == "critical" for row in alerts)
+        assert any(str(night.call_uuid) in message and "outside_call_window" in message for message in messages)
+        assert any(str(lunch.call_uuid) in message and "forbid_lunch_window" in message for message in messages)
+        assert all(str(allowed.call_uuid) not in message and str(blocked.call_uuid) not in message for message in messages)
 
 
 def test_due_dispatch_runs_every_minute() -> None:
