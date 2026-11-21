@@ -28,7 +28,8 @@ def main() -> None:
     if "def render_opening" not in (ROOT / "backend" / "app" / "compliance" / "opening.py").read_text(encoding="utf-8"):
         raise SystemExit("opening template missing")
     print("go-live static checks passed")
-    print("manual gates still required: real trunk smoke, backup restore drill, legal review of section 12")
+    print("manual gates still required: real trunk smoke, legal review of section 12")
+    print("backup restore drill: python scripts/backup_restore_drill.py")
 
 
 if __name__ == "__main__":
