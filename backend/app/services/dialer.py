@@ -15,10 +15,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.compliance.gate_pre import CampaignView, Flags, TenantView, TrunkView, pre_dial_gate
 from app.compliance.qualification import apply_qualification_clock
 from app.compliance.guard_incall import on_caller_text
-from app.compliance.qc_post import block_followups, review_call, wants_reschedule
+from app.compliance.qc_post import block_followups, mark_recording_missing, review_call, wants_reschedule
 from app.config import Settings
 from app.models import Call, CallEvent, CallerNumber, Campaign, Contact, Task, Tenant, Trunk, User
 from app.models.extra import (
+    Alert,
     BillingItem,
     BillingRate,
     CallTransfer,
@@ -427,17 +428,22 @@ async def _place(
             )
         )
     meta = label_meta(call_uuid, settings.aigc_producer_code)
-    session.add(
-        Recording(
-            tenant_id=campaign.tenant_id,
-            call_id=call.id,
-            object_key=write_recording(tenant.id, call_uuid, outcome.turns, meta),
-            aigc_label_meta=meta,
-            explicit_label=EXPLICIT_AIGC,
-            created_by=campaign.created_by,
-            retain_until=now + timedelta(days=180),
+    try:
+        object_key = write_recording(tenant.id, call_uuid, outcome.turns, meta)
+    except OSError:
+        object_key = None
+    if object_key is not None:
+        session.add(
+            Recording(
+                tenant_id=campaign.tenant_id,
+                call_id=call.id,
+                object_key=object_key,
+                aigc_label_meta=meta,
+                explicit_label=EXPLICIT_AIGC,
+                created_by=campaign.created_by,
+                retain_until=now + timedelta(days=180),
+            )
         )
-    )
     turns: list[dict[str, str]] = [{"speaker": "assistant", "text": outcome.reply_text}]
     if outcome.heard:
         turns.append({"speaker": "caller", "text": outcome.heard})
@@ -448,6 +454,24 @@ async def _place(
         redline_hits=outcome.redline_hits,
         transcript_present=True,
     )
+    if object_key is None:
+        review = mark_recording_missing(review)
+        session.add(
+            Alert(
+                tenant_id=campaign.tenant_id,
+                severity="critical",
+                code="recording_missing",
+                message=f"通话 {call_uuid} 已生成但录音未落盘",
+            )
+        )
+        session.add(
+            CallEvent(
+                tenant_id=campaign.tenant_id,
+                call_id=call.id,
+                event_type="recording_missing",
+                detail={"call_uuid": str(call_uuid)},
+            )
+        )
     session.add(
         Transcript(
             tenant_id=campaign.tenant_id,

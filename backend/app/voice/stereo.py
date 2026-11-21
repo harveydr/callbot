@@ -132,7 +132,9 @@ def write_recording(tenant_id: uuid.UUID, call_uuid: uuid.UUID, turns: list[dict
     root = _root()
     path = root / str(tenant_id) / f"{call_uuid}.wav"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(stereo_wav(turns, aigc=aigc, explicit_label=EXPLICIT_LABEL))
+    temporary = path.with_suffix(".part")
+    temporary.write_bytes(stereo_wav(turns, aigc=aigc, explicit_label=EXPLICIT_LABEL))
+    temporary.replace(path)
     return f"recordings/{tenant_id}/{call_uuid}.wav"
 
 

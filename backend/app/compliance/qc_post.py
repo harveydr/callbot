@@ -101,6 +101,19 @@ def review_call(
     return QcReview(result, summary if isinstance(summary, str) else None, result == "fail", detail)
 
 
+def mark_recording_missing(review: QcReview) -> QcReview:
+    """A call record without a stored recording stays billable and enters review."""
+    detail = dict(review.detail)
+    detail["recording_missing"] = True
+    qc = detail.get("qc")
+    qc_detail = dict(qc) if isinstance(qc, dict) else {}
+    qc_detail["recording_missing"] = True
+    result = review.result if review.result == "fail" else "warn"
+    qc_detail["result"] = result
+    detail["qc"] = qc_detail
+    return QcReview(result, review.summary, review.block_script, detail)
+
+
 async def block_followups(session: AsyncSession, campaign: Campaign) -> None:
     """A failed script stops later tasks of that campaign."""
     campaign.status = "paused"

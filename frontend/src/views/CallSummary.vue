@@ -5,6 +5,7 @@
       <p v-if="summary">{{ summary }}</p>
       <p v-else>{{ note }}</p>
       <p v-if="explicitLabel" class="aigc">{{ explicitLabel }}</p>
+      <p v-if="recordingMissing">录音未落盘，需人工跟进</p>
       <audio v-if="audioSrc" :src="audioSrc" controls></audio>
       <el-table :data="turns">
         <el-table-column prop="speaker" label="说话方" />
@@ -27,6 +28,7 @@ const note = ref("");
 const summary = ref("");
 const audioSrc = ref("");
 const explicitLabel = ref("");
+const recordingMissing = ref(false);
 const turns = ref([]);
 
 async function load() {
@@ -37,6 +39,7 @@ async function load() {
     const recording = response.data.data.recording;
     const media = recording?.media_base64;
     explicitLabel.value = recording?.explicit_label || "";
+    recordingMissing.value = Boolean(response.data.data.body) && !recording;
     audioSrc.value = media ? `data:audio/wav;base64,${media}` : "";
     turns.value = response.data.data.body?.turns || [];
     status.value = "ready";

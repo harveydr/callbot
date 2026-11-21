@@ -8,11 +8,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.compliance.opening import render_opening
-from app.compliance.qc_post import block_followups, review_call
+from app.compliance.qc_post import block_followups, mark_recording_missing, review_call
 from app.config import load_settings
 from app.db import set_bypass
 from app.models import Call, Campaign, ConsentRecord, Contact, ContactList, DndEntry, ScenarioTemplate, Task, Tenant, Trunk
-from app.models.extra import Alert, QcResult, Transcript
+from app.models.extra import Alert, BillingItem, QcResult, Recording, Transcript
 from app.security.crypto import encrypt_phone, phone_hash
 from app.services.dialer import dial_pending
 
@@ -33,6 +33,9 @@ def test_review_uses_the_transcript_and_does_not_invent_a_summary() -> None:
     assert missing.summary is None and missing.result == "fail"
     assert redline.result == "fail" and redline.block_script is True
     assert long_text.summary is None and long_text.result == "pass"
+    missing_audio = mark_recording_missing(agreed)
+    assert missing_audio.result == "warn" and missing_audio.summary == agreed.summary
+    assert missing_audio.detail["recording_missing"] is True and missing_audio.block_script is False
 
 
 async def _ready(
@@ -146,6 +149,42 @@ async def test_completed_call_stores_summary_and_reschedule(
         assert isinstance(qc_body, dict) and qc_body["purpose_stated"] is True and qc_body["opt_out_offered"] is True
         assert follow is not None and follow.next_run_at == NOW + timedelta(days=1) and follow.status == "pending"
         assert dnd is None
+
+
+async def test_missing_recording_still_bills_and_marks_qc(
+    session_factory: async_sessionmaker[AsyncSession], redis_client, monkeypatch
+) -> None:
+    def unavailable(*_args: object, **_kwargs: object) -> str:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("app.services.dialer.write_recording", unavailable)
+    settings = load_settings()
+    async with session_factory() as session:
+        await set_bypass(session)
+        tenant, trunk, campaign, contact = await _ready(session, "qc-norec", "13800001223")
+        session.add(Task(tenant_id=tenant.id, campaign_id=campaign.id, contact_id=contact.id, attempt_no=1, status="pending"))
+        await session.flush()
+        started = await dial_pending(
+            session,
+            campaign=campaign,
+            tenant=tenant,
+            trunk=trunk,
+            settings=settings,
+            redis=redis_client,
+            now=NOW,
+            heard="好的",
+        )
+        call = await session.scalar(select(Call).where(Call.campaign_id == campaign.id))
+        assert started == 1 and call is not None and call.status == "completed"
+        recording = await session.scalar(select(Recording).where(Recording.call_id == call.id))
+        billing = await session.scalar(select(BillingItem).where(BillingItem.call_id == call.id))
+        qc = await session.scalar(select(QcResult).where(QcResult.call_id == call.id))
+        alert = await session.scalar(select(Alert).where(Alert.tenant_id == tenant.id, Alert.code == "recording_missing"))
+        assert recording is None
+        assert billing is not None and billing.amount is None
+        assert qc is not None and qc.result == "warn" and qc.detail["recording_missing"] is True
+        assert alert is not None and str(call.call_uuid) in alert.message
+        assert campaign.status == "running"
 
 
 async def test_redline_failure_pauses_later_tasks(session_factory: async_sessionmaker[AsyncSession]) -> None:
