@@ -350,6 +350,42 @@ async def test_llm_outage_uses_the_script_phrase_and_leaves_tts_closed() -> None
     assert tts.open is False
 
 
+async def test_silence_clarifies_once_and_then_says_goodbye() -> None:
+    script = [
+        {
+            "node_key": "n_open",
+            "node_type": "mandatory",
+            "content": {"text": "必须播报的开场要点。", "fallback_after_ms": 4000, "next": "n_gate"},
+        },
+        {
+            "node_key": "n_bye",
+            "node_type": "mandatory",
+            "content": {"text": "不再打扰。"},
+        },
+    ]
+    first = await run_session(
+        [Frame("caller", b"SILENCE")],
+        company="回声",
+        purpose="通知",
+        script=script,
+    )
+    second = await run_session(
+        [Frame("caller", b"SILENCE")],
+        company="回声",
+        purpose="通知",
+        script=script,
+        prior_silence=1,
+    )
+    assert first.action == "speak"
+    assert "没有听清" in first.reply_text
+    assert "必须播报的开场要点。" in first.reply_text
+    assert opening_is_complete(first.reply_text)
+    assert second.action == "hangup"
+    assert second.reply_text.endswith("不再打扰。")
+    assert "没有听清" not in second.reply_text
+    assert opening_is_complete(second.reply_text)
+
+
 async def test_a_slow_model_plays_the_filler_after_the_opening() -> None:
     slow = iter((0.0, 0.401))
     boundary = iter((0.0, 0.4))

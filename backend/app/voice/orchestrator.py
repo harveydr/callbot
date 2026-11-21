@@ -23,6 +23,8 @@ _SCRIPT_MODE = "我用标准流程为您解答。"
 _TTS_CALLBACK = "稍后为您回拨。"
 _FILLER = "嗯，我帮您看下哈。"
 _FILLER_AFTER_MS = 400.0
+_CLARIFY = "您好，我没有听清，方便的话请再说一次。"
+_BYE = "那先不打扰您了。"
 
 
 @dataclass(frozen=True)
@@ -70,6 +72,18 @@ def _with_filler(reply: str, opening: str, waited_ms: float | None) -> str:
     if reply.startswith(opening):
         return f"{opening}{_FILLER}{reply.removeprefix(opening)}"
     return f"{_FILLER}{reply}"
+
+
+def _node_text(script: list[dict[str, object]] | None, key: str) -> str:
+    for item in script or []:
+        if item.get("node_key") != key and item.get("id") != key:
+            continue
+        content = item.get("content")
+        if isinstance(content, dict):
+            text = content.get("text") or content.get("must_say")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+    return ""
 
 
 def _reply(intent: str, opening: str) -> tuple[str, str]:
@@ -126,6 +140,7 @@ async def run_session(
     script: list[dict[str, object]] | None = None,
     require_guardian: bool = False,
     llm_clock: Callable[[], float] | None = None,
+    prior_silence: int = 0,
 ) -> Outcome:
     started = time.perf_counter()
     recognizer = asr or MockAsr()
@@ -139,6 +154,7 @@ async def run_session(
     playback.speak(opening)
     tts_down = await _speak(speaker, tts_circuit, opening)
     heard_parts: list[str] = []
+    silence_frames = 0
     degraded = tts_down
     asr_attempts = 0
     asr_errors = 0
@@ -153,7 +169,10 @@ async def run_session(
             else:
                 playback.drop_assistant()
             continue
-        if frame.channel != "caller" or not vad.is_speech(frame.pcm):
+        if frame.channel != "caller":
+            continue
+        if not vad.is_speech(frame.pcm):
+            silence_frames += 1
             continue
         text, used_fallback, attempted, failed = await _asr_text(recognizer, circuit, frame.pcm)
         if attempted:
@@ -164,13 +183,16 @@ async def run_session(
         if text:
             heard_parts.append(text)
     heard = strip_injection("".join(heard_parts))
+    no_input = silence_frames > 0 and not heard
     clock = llm_clock or time.perf_counter
     llm_started = clock()
-    if llm_mode == "down":
+    if llm_mode == "down" and not no_input:
         llm_circuit.observe(503)
-    llm_down = not llm_circuit.allow_vendor()
+    llm_down = False if no_input else not llm_circuit.allow_vendor()
     llm_first_token_ms: float | None = None
-    if llm_down:
+    if no_input:
+        intent = "invalid"
+    elif llm_down:
         intent = classify_intent(heard)
         degraded = True
     else:
@@ -200,6 +222,14 @@ async def run_session(
         reply = opening + script_body
     else:
         action, reply = _reply(intent, opening)
+    if no_input and prior_silence >= 1:
+        bye = _node_text(script, "n_bye") or _BYE
+        action = "hangup"
+        reply = f"{opening}{bye}"
+        mandatory = [bye]
+    elif no_input and _CLARIFY not in reply:
+        action = "speak"
+        reply = f"{reply}{_CLARIFY}"
     guarded, hits, guard_action = guard_assistant_text(reply, prior_hits=0)
     for line in mandatory:
         if line not in guarded:
