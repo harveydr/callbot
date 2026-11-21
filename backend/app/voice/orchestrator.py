@@ -24,7 +24,9 @@ _TTS_CALLBACK = "稍后为您回拨。"
 _FILLER = "嗯，我帮您看下哈。"
 _FILLER_AFTER_MS = 400.0
 _CLARIFY = "您好，我没有听清，方便的话请再说一次。"
+_FORMAT_CLARIFY = "不好意思，我再确认一下您的意思。"
 _BYE = "那先不打扰您了。"
+_INTENTS = {"agree", "refuse", "hesitate", "inquiry", "complaint", "invalid"}
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,8 @@ class Outcome:
     llm_first_token_ms: float | None = None
     dropped_assistant_frames: int = 0
     channels: dict[str, str] = field(default_factory=dict)
+    llm_format_error: bool = False
+    intent_confidence: float = 0.5
 
 
 def strip_injection(text: str) -> str:
@@ -72,6 +76,42 @@ def _with_filler(reply: str, opening: str, waited_ms: float | None) -> str:
     if reply.startswith(opening):
         return f"{opening}{_FILLER}{reply.removeprefix(opening)}"
     return f"{_FILLER}{reply}"
+
+
+def _object(raw: str) -> dict[str, object] | None:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed, dict):
+        return parsed
+    return None
+
+
+def _confidence(parsed: dict[str, object] | None) -> float:
+    if parsed is None:
+        return 0.5
+    raw = parsed.get("confidence")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return 0.5
+    value = float(raw)
+    if value < 0 or value > 1:
+        return 0.5
+    return value
+
+
+def _payloads(llm_mode: str, heard: str) -> list[str]:
+    if llm_mode == "bad_json":
+        return ["NOT_JSON", "{"]
+    if llm_mode == "bad_then_ok":
+        return ["NOT_JSON", json.dumps({"intent": "agree"}, ensure_ascii=False)]
+    if llm_mode == "bare":
+        return [json.dumps({"intent": "agree"}, ensure_ascii=False)]
+    if llm_mode == "hostile":
+        return [json.dumps({"intent": "agree", "say": "我们保证收益", "skip_compliance": True}, ensure_ascii=False)]
+    if llm_mode == "priced":
+        return [json.dumps({"intent": "inquiry", "say": "费用是 99 元，合同自动续费。"}, ensure_ascii=False)]
+    return [json.dumps({"intent": classify_intent(heard)}, ensure_ascii=False)]
 
 
 def _node_text(script: list[dict[str, object]] | None, key: str) -> str:
@@ -191,33 +231,37 @@ async def run_session(
     llm_down = False if no_input else not llm_circuit.allow_vendor()
     llm_first_token_ms: float | None = None
     model_say = ""
+    format_error = False
+    confidence = 0.5
     if no_input:
         intent = "invalid"
     elif llm_down:
         intent = classify_intent(heard)
         degraded = True
     else:
-        if llm_mode == "bad_json":
-            raw = "NOT_JSON"
+        parsed: dict[str, object] | None = None
+        for raw in _payloads(llm_mode, heard):
+            parsed = _object(raw)
+            if parsed is not None:
+                break
+        format_error = parsed is None
+        if llm_mode == "ok" and not format_error:
+            llm_circuit.observe_success()
+        if format_error:
+            intent = "inquiry"
             degraded = True
         elif llm_mode == "hostile":
-            raw = json.dumps({"intent": "agree", "say": "我们保证收益", "skip_compliance": True}, ensure_ascii=False)
-        elif llm_mode == "priced":
-            raw = json.dumps({"intent": "inquiry", "say": "费用是 99 元，合同自动续费。"}, ensure_ascii=False)
-        else:
-            raw = json.dumps({"intent": classify_intent(heard)}, ensure_ascii=False)
-            llm_circuit.observe_success()
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            parsed = None
-            degraded = True
-        model_intent = parsed.get("intent") if isinstance(parsed, dict) else None
-        intent = model_intent if isinstance(model_intent, str) and llm_mode == "ok" else classify_intent(heard)
-        if llm_mode == "hostile":
             intent = classify_intent(heard)
-        if llm_mode == "priced" and isinstance(parsed, dict) and isinstance(parsed.get("say"), str):
-            model_say = parsed["say"]
+        else:
+            model_intent = parsed.get("intent") if parsed is not None else None
+            if isinstance(model_intent, str) and model_intent in _INTENTS:
+                intent = model_intent
+            else:
+                intent = "inquiry" if llm_mode != "ok" else classify_intent(heard)
+            say = parsed.get("say") if parsed is not None else None
+            if llm_mode == "priced" and isinstance(say, str):
+                model_say = say
+        confidence = 0.5 if format_error else _confidence(parsed)
         llm_first_token_ms = (clock() - llm_started) * 1000
     script_body, script_action, mandatory = render_script(
         parse_nodes(script), intent=intent, require_guardian=require_guardian
@@ -235,6 +279,8 @@ async def run_session(
     elif no_input and _CLARIFY not in reply:
         action = "speak"
         reply = f"{reply}{_CLARIFY}"
+    elif format_error and _FORMAT_CLARIFY not in reply:
+        reply = f"{reply}{_FORMAT_CLARIFY}"
     nodes = parse_nodes(script)
     knowledge = active_knowledge(nodes, intent=intent)
     if model_say and knowledge is not None:
@@ -283,4 +329,6 @@ async def run_session(
         llm_first_token_ms=llm_first_token_ms,
         dropped_assistant_frames=playback.dropped_assistant_frames,
         channels=channels,
+        llm_format_error=format_error,
+        intent_confidence=confidence,
     )

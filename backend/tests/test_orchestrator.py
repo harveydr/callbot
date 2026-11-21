@@ -13,6 +13,7 @@ from app.config import load_settings
 from app.db import set_bypass
 from app.models import (
     Call,
+    CallEvent,
     Campaign,
     ConsentRecord,
     Contact,
@@ -23,8 +24,10 @@ from app.models import (
     Tenant,
     Trunk,
 )
+from app.models.extra import CallTurn
 from app.security.crypto import encrypt_phone, phone_hash
 from app.services.dialer import dial_pending
+from tests.test_dispatch import _world
 from app.voice.asr import MockAsr
 from app.voice.circuit import VendorCircuit
 from app.voice.orchestrator import Frame, run_session
@@ -97,6 +100,37 @@ async def test_vendor_429_opens_circuit_and_falls_back() -> None:
     assert first.intent == "agree"
     assert second.intent == "agree"
     assert asr.calls == 1
+
+
+async def test_broken_model_json_retries_once_then_asks_again() -> None:
+    broken = await run_session(
+        [Frame("caller", "PCM:好的".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        llm_mode="bad_json",
+    )
+    recovered = await run_session(
+        [Frame("caller", "PCM:什么事情".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        llm_mode="bad_then_ok",
+    )
+    bare = await run_session(
+        [Frame("caller", "PCM:什么事情".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        llm_mode="bare",
+    )
+    assert broken.intent == "inquiry"
+    assert broken.llm_format_error is True
+    assert broken.intent_confidence == 0.5
+    assert "再确认一下" in broken.reply_text
+    assert opening_is_complete(broken.reply_text)
+    assert recovered.intent == "agree"
+    assert recovered.llm_format_error is False
+    assert "再确认一下" not in recovered.reply_text
+    assert bare.intent == "agree"
+    assert bare.intent_confidence == 0.5
 
 
 async def test_bad_json_and_prompt_injection_do_not_skip_the_opening() -> None:
@@ -467,3 +501,34 @@ async def test_asr_429_does_not_open_tts_or_llm() -> None:
     assert asr_circuit.open is True
     assert tts_circuit.open is False
     assert llm_circuit.open is False
+
+
+async def test_a_format_error_is_stored_on_the_call(
+    session_factory: async_sessionmaker[AsyncSession], redis_client
+) -> None:
+    settings = load_settings()
+    async with session_factory() as session:
+        await set_bypass(session)
+        tenant, trunk, campaign, contact, _caller = await _world(session, "fmt-err", phone="13800006781")
+        session.add(Task(tenant_id=tenant.id, campaign_id=campaign.id, contact_id=contact.id, attempt_no=1, status="pending"))
+        await session.flush()
+        started = await dial_pending(
+            session,
+            campaign=campaign,
+            tenant=tenant,
+            trunk=trunk,
+            settings=settings,
+            redis=redis_client,
+            now=NOW,
+            heard="好的",
+            llm_mode="bad_json",
+        )
+        call = await session.scalar(select(Call).where(Call.contact_id == contact.id))
+        event = await session.scalar(
+            select(CallEvent).where(CallEvent.call_id == call.id, CallEvent.event_type == "llm_format_error")
+        ) if call is not None else None
+        spoken = await session.scalar(select(CallTurn.text_content).where(CallTurn.speaker == "assistant"))
+    assert started == 1
+    assert call is not None and call.intent_grade == "C"
+    assert event is not None and event.detail == {"retried": True}
+    assert spoken is not None and "再确认一下" in spoken and opening_is_complete(spoken)

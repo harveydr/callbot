@@ -129,6 +129,7 @@ async def dial_pending(
     redis: redis_async.Redis,
     now: datetime,
     heard: str = "好的",
+    llm_mode: str = "ok",
 ) -> int:
     """Dial pending tasks up to the live concurrency limit. Returns calls created."""
     if campaign.status != "running":
@@ -187,7 +188,7 @@ async def dial_pending(
                 await _blocked(session, campaign, contact, task, "COMPLIANCE_SCENARIO_NOT_ALLOWED", "caller_blocked", moment)
                 continue
             try:
-                await _place(session, campaign, tenant, contact, task, settings, redis, moment, heard, caller)
+                await _place(session, campaign, tenant, contact, task, settings, redis, moment, heard, caller, llm_mode)
             except Exception:
                 task.status = "failed"
                 raise
@@ -460,6 +461,7 @@ async def _place(
     now: datetime,
     heard: str,
     caller: CallerNumber | None,
+    llm_mode: str = "ok",
 ) -> None:
     frames = [] if heard == "无人接听" else [Frame("caller", f"PCM:{heard}".encode("utf-8"))]
     script = await load_template_script(session, redis, campaign.template_id)
@@ -476,6 +478,7 @@ async def _place(
             tts_circuit=tts_circuit,
             llm_circuit=llm_circuit,
             require_guardian=contact.minor,
+            llm_mode=llm_mode,
         )
         await record_voice(
             redis,
@@ -636,6 +639,15 @@ async def _place(
             detail={"played": True},
         )
     )
+    if outcome.llm_format_error:
+        session.add(
+            CallEvent(
+                tenant_id=campaign.tenant_id,
+                call_id=call.id,
+                event_type="llm_format_error",
+                detail={"retried": True},
+            )
+        )
     rate = await session.scalar(
         select(BillingRate)
         .where((BillingRate.tenant_id == tenant.id) | (BillingRate.tenant_id.is_(None)))
