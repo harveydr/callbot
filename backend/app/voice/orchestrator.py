@@ -46,6 +46,9 @@ class Outcome:
     circuit_open: bool
     tts_down: bool = False
     llm_down: bool = False
+    asr_attempts: int = 0
+    asr_errors: int = 0
+    llm_first_token_ms: float | None = None
     dropped_assistant_frames: int = 0
     channels: dict[str, str] = field(default_factory=dict)
 
@@ -84,16 +87,17 @@ async def _speak(speaker: MockTts, circuit: CircuitPort, text: str) -> bool:
     return False
 
 
-async def _asr_text(asr: MockAsr, circuit: CircuitPort, pcm: bytes) -> tuple[str, bool]:
+async def _asr_text(asr: MockAsr, circuit: CircuitPort, pcm: bytes) -> tuple[str, bool, bool, bool]:
+    """Return text, degraded, whether the vendor was called, and whether that call failed."""
     if not circuit.allow_vendor():
-        return decode_pcm(pcm), True
+        return decode_pcm(pcm), True, False, False
     try:
         text = await asr.transcribe(pcm)
     except VendorRejected as exc:
         circuit.observe(exc.status)
-        return decode_pcm(pcm), True
+        return decode_pcm(pcm), True, True, True
     circuit.observe_success()
-    return text, False
+    return text, False, True, False
 
 
 async def run_session(
@@ -123,6 +127,8 @@ async def run_session(
     tts_down = await _speak(speaker, tts_circuit, opening)
     heard_parts: list[str] = []
     degraded = tts_down
+    asr_attempts = 0
+    asr_errors = 0
     for frame in frames:
         if frame.dropped:
             continue
@@ -136,15 +142,20 @@ async def run_session(
             continue
         if frame.channel != "caller" or not vad.is_speech(frame.pcm):
             continue
-        text, used_fallback = await _asr_text(recognizer, circuit, frame.pcm)
+        text, used_fallback, attempted, failed = await _asr_text(recognizer, circuit, frame.pcm)
+        if attempted:
+            asr_attempts += 1
+            asr_errors += 1 if failed else 0
         degraded = degraded or used_fallback
         playback.hear(text)
         if text:
             heard_parts.append(text)
     heard = strip_injection("".join(heard_parts))
+    llm_started = time.perf_counter()
     if llm_mode == "down":
         llm_circuit.observe(503)
     llm_down = not llm_circuit.allow_vendor()
+    llm_first_token_ms: float | None = None
     if llm_down:
         intent = classify_intent(heard)
         degraded = True
@@ -166,6 +177,7 @@ async def run_session(
         intent = model_intent if isinstance(model_intent, str) and llm_mode == "ok" else classify_intent(heard)
         if llm_mode == "hostile":
             intent = classify_intent(heard)
+        llm_first_token_ms = (time.perf_counter() - llm_started) * 1000
     script_body, script_action, mandatory = render_script(
         parse_nodes(script), intent=intent, require_guardian=require_guardian
     )
@@ -204,6 +216,9 @@ async def run_session(
         circuit_open=circuit.open,
         tts_down=tts_down,
         llm_down=llm_down,
+        asr_attempts=asr_attempts,
+        asr_errors=asr_errors,
+        llm_first_token_ms=llm_first_token_ms,
         dropped_assistant_frames=playback.dropped_assistant_frames,
         channels=channels,
     )

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
+from datetime import datetime, timezone
 from collections.abc import AsyncIterator
 from typing import Any, cast
 from contextlib import asynccontextmanager
@@ -18,6 +20,7 @@ from app.api import tenant_routes as _tenant_routes  # noqa: F401
 from app.api.surface import auth_router, envelope, platform_router, tenant_router
 from app.config import Settings, load_settings
 from app.services.control import utcnow
+from app.services.ops_alerts import record_http
 from app.db import make_engine, make_session_factory
 from app.errors import ApiError
 
@@ -74,7 +77,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     )
                     response.headers["X-Request-ID"] = trace_id
                     return response
+        started = time.perf_counter()
         response = await call_next(request)
+        if request.url.path.startswith("/api/"):
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            client = getattr(request.app.state, "redis", None)
+            if client is not None:
+                await record_http(client, elapsed_ms, datetime.now(timezone.utc))
         response.headers["X-Request-ID"] = trace_id
         for key, value in _SECURITY_HEADERS.items():
             if key == "X-Request-ID":

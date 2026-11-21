@@ -29,6 +29,7 @@ from app.models.extra import (
 )
 from app.services.billing_budget import apply_billing_budget
 from app.services.number_health import refresh_caller_health
+from app.services.ops_alerts import record_voice
 from app.services.tokens import TokenBucket
 from app.voice.circuit import CircuitPort, SharedVendorCircuit
 from app.voice.orchestrator import Frame, run_session
@@ -181,7 +182,7 @@ async def dial_pending(
         if not held:
             break
         try:
-            await _place(session, campaign, tenant, contact, task, settings, moment, heard, caller)
+            await _place(session, campaign, tenant, contact, task, settings, redis, moment, heard, caller)
         except Exception:
             task.status = "failed"
             raise
@@ -433,6 +434,7 @@ async def _place(
     contact: Contact,
     task: Task,
     settings: Settings,
+    redis: redis_async.Redis,
     now: datetime,
     heard: str,
     caller: CallerNumber | None,
@@ -457,6 +459,13 @@ async def _place(
             tts_circuit=tts_circuit,
             llm_circuit=llm_circuit,
             require_guardian=contact.minor,
+        )
+        await record_voice(
+            redis,
+            asr_attempts=outcome.asr_attempts,
+            asr_errors=outcome.asr_errors,
+            llm_first_token_ms=outcome.llm_first_token_ms,
+            now=now,
         )
         _store_circuit_alerts(session, campaign.tenant_id, asr_circuit, "asr")
         _store_circuit_alerts(session, campaign.tenant_id, tts_circuit, "tts")

@@ -32,6 +32,12 @@ groups:
       - alert: CertExpire
         expr: cert_expire_days < 30
         labels: {severity: warning}
+      - alert: CertExpireSoon
+        expr: cert_expire_days < 7
+        labels: {severity: warning}
+      - alert: CertExpireCritical
+        expr: cert_expire_days < 1
+        labels: {severity: critical}
       - alert: OffWindowCall
         expr: offwindow_call_count > 0
         labels: {severity: critical}
