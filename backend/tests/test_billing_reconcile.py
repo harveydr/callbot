@@ -11,10 +11,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db import set_bypass
 from app.models import Call, CallEvent, Campaign, Contact, ContactList, ScenarioTemplate, Tenant, Trunk
-from app.models.extra import BillingDispute, BillingItem
+from app.models.extra import Alert, BillingDispute, BillingItem
 from app.security.crypto import encrypt_phone, phone_hash
 from app.services.exports import export_expires_at, export_is_usable
-from app.tasks.billing import VendorCdr, apply_vendor_cdr
+from app.tasks.billing import VendorCdr, apply_vendor_cdr, duration_gap, reconcile_vendor_bill
 
 NOW = datetime(2026, 11, 22, 2, 0, tzinfo=timezone.utc)
 KEY = __import__("base64").b64decode("AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=")
@@ -151,6 +151,111 @@ async def test_missing_cdr_is_filled_and_price_gap_is_a_dispute(
         assert dispute is not None
         assert dispute.reason == "local_amount_unquoted"
         assert call.duration_sec == 18
+
+
+def test_duration_gap_uses_a_five_percent_threshold() -> None:
+    assert duration_gap(100, 105) is False
+    assert duration_gap(100, 106) is True
+    assert duration_gap(30, 0) is True
+    assert duration_gap(0, 30) is False
+
+
+async def test_duration_mismatch_opens_a_dispute_without_changing_the_price(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        call = await _call(session, amount=Decimal("1.0000"))
+        call.duration_sec = 100
+        result = await apply_vendor_cdr(
+            session,
+            call=call,
+            cdr=VendorCdr("evt-gap", 106, Decimal("1.0000")),
+            now=NOW,
+        )
+        item = await session.scalar(select(BillingItem).where(BillingItem.call_uuid == call.call_uuid))
+        dispute = await session.scalar(select(BillingDispute).where(BillingDispute.billing_item_id == item.id)) if item else None
+        alert = await session.scalar(select(Alert).where(Alert.tenant_id == call.tenant_id, Alert.code == "billing_dispute"))
+        assert result == "disputed"
+        assert call.duration_sec == 100
+        assert item is not None and item.amount == Decimal("1.0000")
+        assert dispute is not None and dispute.reason == "duration_mismatch"
+        assert alert is not None and "未自动扣费" in alert.message
+
+
+async def test_duration_inside_five_percent_is_not_a_dispute(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        call = await _call(session, amount=Decimal("1.0000"))
+        call.duration_sec = 100
+        result = await apply_vendor_cdr(
+            session,
+            call=call,
+            cdr=VendorCdr("evt-close", 104, Decimal("1.0000")),
+            now=NOW,
+        )
+        item = await session.scalar(select(BillingItem).where(BillingItem.call_uuid == call.call_uuid))
+        dispute = None
+        if item is not None:
+            dispute = await session.scalar(select(BillingDispute).where(BillingDispute.billing_item_id == item.id))
+        assert result == "applied"
+        assert call.duration_sec == 100
+        assert dispute is None
+
+
+async def test_local_call_missing_from_the_vendor_bill_is_disputed_once(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        listed = await _call(session, amount=Decimal("1.0000"))
+        listed.duration_sec = 40
+        missing = Call(
+            tenant_id=listed.tenant_id,
+            campaign_id=listed.campaign_id,
+            contact_id=listed.contact_id,
+            call_uuid=uuid.uuid4(),
+            status="completed",
+            trunk_id=listed.trunk_id,
+            template_version=1,
+            duration_sec=40,
+            start_at=NOW,
+            end_at=NOW,
+        )
+        session.add(missing)
+        await session.flush()
+        session.add(
+            BillingItem(
+                tenant_id=listed.tenant_id,
+                call_id=missing.id,
+                call_uuid=missing.call_uuid,
+                amount=Decimal("1.5000"),
+                currency="CNY",
+                rate_note="quoted",
+            )
+        )
+        await session.flush()
+        first = await reconcile_vendor_bill(
+            session,
+            tenant_id=listed.tenant_id,
+            present_call_uuids={listed.call_uuid},
+            period_start=NOW,
+            period_end=NOW + timedelta(days=1),
+            now=NOW,
+        )
+        second = await reconcile_vendor_bill(
+            session,
+            tenant_id=listed.tenant_id,
+            present_call_uuids={listed.call_uuid},
+            period_start=NOW,
+            period_end=NOW + timedelta(days=1),
+            now=NOW,
+        )
+        item = await session.scalar(select(BillingItem).where(BillingItem.call_uuid == missing.call_uuid))
+        dispute = await session.scalar(select(BillingDispute).where(BillingDispute.billing_item_id == item.id)) if item else None
+        assert first == 1
+        assert second == 0
+        assert item is not None and item.amount == Decimal("1.5000")
+        assert dispute is not None and dispute.reason == "vendor_bill_missing"
 
 
 def test_export_link_expires_after_fifteen_minutes() -> None:
