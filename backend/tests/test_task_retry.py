@@ -12,6 +12,7 @@ _NAMES = (
     "billing_reconcile",
     "probe_missing_cdr",
     "sweep_qualifications",
+    "ensure_audit_partitions",
 )
 
 
