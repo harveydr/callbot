@@ -31,9 +31,9 @@ from app.models.extra import (
 )
 from app.services.tokens import TokenBucket
 from app.voice.orchestrator import Frame, run_session
-from app.voice.stereo import write_recording
+from app.voice.stereo import EXPLICIT_LABEL, label_meta, write_recording
 
-EXPLICIT_AIGC = "以下为人工智能生成合成语音"
+EXPLICIT_AIGC = EXPLICIT_LABEL
 _RETRYABLE = ("no_answer", "busy")
 _REJECTED_HEARD = frozenset({"拒接", "用户拒接"})
 _REJECT_SAMPLE = 5
@@ -426,15 +426,12 @@ async def _place(
                 text_content=outcome.heard,
             )
         )
-    producer = settings.aigc_producer_code or "UNREGISTERED"
-    meta: dict[str, object] = {
-        "AIGC": {"Label": "1", "ContentProducer": producer, "ProduceID": str(call_uuid)}
-    }
+    meta = label_meta(call_uuid, settings.aigc_producer_code)
     session.add(
         Recording(
             tenant_id=campaign.tenant_id,
             call_id=call.id,
-            object_key=write_recording(tenant.id, call_uuid, outcome.turns),
+            object_key=write_recording(tenant.id, call_uuid, outcome.turns, meta),
             aigc_label_meta=meta,
             explicit_label=EXPLICIT_AIGC,
             created_by=campaign.created_by,

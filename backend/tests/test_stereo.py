@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
@@ -12,9 +13,40 @@ from app.db import set_bypass
 from app.models import Call, Campaign, ConsentRecord, Contact, ContactList, ScenarioTemplate, Task, Tenant, Trunk
 from app.security.crypto import encrypt_phone, phone_hash
 from app.services.dialer import dial_pending
-from app.voice.stereo import ASSISTANT_SAMPLE, CALLER_SAMPLE, split_channels, stereo_wav
+from app.voice.stereo import (
+    ASSISTANT_SAMPLE,
+    BLOCK_SIZE,
+    CALLER_SAMPLE,
+    EXPLICIT_LABEL,
+    label_meta,
+    read_labels,
+    split_channels,
+    stereo_wav,
+)
 
 NOW = datetime(2026, 11, 22, 2, 0, tzinfo=timezone.utc)
+
+
+def test_file_starts_with_the_explicit_label_and_aigc_chunk() -> None:
+    call_uuid = uuid.uuid4()
+    meta = label_meta(call_uuid, "")
+    raw = meta["AIGC"]
+    assert isinstance(raw, dict)
+    wav = stereo_wav(
+        [{"speaker": "caller", "channel": "caller", "text": "好的"}],
+        aigc=raw,
+        explicit_label=EXPLICIT_LABEL,
+    )
+    labels = read_labels(wav)
+    assert labels["explicit_label"] == EXPLICIT_LABEL
+    stored = labels["AIGC"]
+    assert isinstance(stored, dict)
+    assert stored["Label"] == "1" and stored["ContentProducer"] == "UNREGISTERED"
+    assert stored["ProduceID"] == str(call_uuid)
+    left, right = split_channels(wav)
+    assert left[:BLOCK_SIZE] == [0] * BLOCK_SIZE
+    assert right[:BLOCK_SIZE] == [ASSISTANT_SAMPLE] * BLOCK_SIZE
+    assert left[BLOCK_SIZE : BLOCK_SIZE * 2] == [CALLER_SAMPLE] * BLOCK_SIZE
 
 
 def test_channels_are_not_swapped() -> None:
@@ -118,5 +150,11 @@ async def test_dial_writes_a_stereo_recording(
         assert call is not None
         wav = (tmp_path / str(tenant.id) / f"{call.call_uuid}.wav").read_bytes()
         left, right = split_channels(wav)
+        labels = read_labels(wav)
+        assert labels["explicit_label"] == EXPLICIT_LABEL
+        stored = labels["AIGC"]
+        assert isinstance(stored, dict) and stored["ProduceID"] == str(call.call_uuid) and stored["Label"] == "1"
+        assert left[:BLOCK_SIZE] == [0] * BLOCK_SIZE
+        assert right[:BLOCK_SIZE] == [ASSISTANT_SAMPLE] * BLOCK_SIZE
         assert CALLER_SAMPLE in left and ASSISTANT_SAMPLE not in left
         assert ASSISTANT_SAMPLE in right and CALLER_SAMPLE not in right
