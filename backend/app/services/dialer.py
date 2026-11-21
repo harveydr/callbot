@@ -28,6 +28,7 @@ from app.models.extra import (
     Transcript,
 )
 from app.services.billing_budget import apply_billing_budget
+from app.services.call_state import move_call, reach
 from app.services.number_health import refresh_caller_health
 from app.services.ops_alerts import record_voice
 from app.services.tokens import TokenBucket
@@ -325,7 +326,7 @@ async def _handoff(
     if agent is not None:
         session.add(CallTransfer(tenant_id=campaign.tenant_id, call_id=call.id, agent_id=agent.id, status="pending"))
         return
-    call.status = "transfer_failed"
+    move_call(call, "transfer_failed")
     session.add(
         CallEvent(
             tenant_id=campaign.tenant_id,
@@ -392,7 +393,7 @@ async def _blocked(
         campaign_id=campaign.id,
         contact_id=contact.id,
         call_uuid=uuid.uuid4(),
-        status="blocked_compliance",
+        status="queued",
         block_reason=reason,
         trunk_id=campaign.trunk_id,
         template_version=campaign.template_version,
@@ -402,6 +403,7 @@ async def _blocked(
         compliance_hit=[{"code": code, "reason": reason}],
         created_by=campaign.created_by,
     )
+    reach(call, "blocked_compliance")
     session.add(call)
     await session.flush()
     session.add(
@@ -507,7 +509,7 @@ async def _place(
         campaign_id=campaign.id,
         contact_id=contact.id,
         call_uuid=call_uuid,
-        status=status,
+        status="queued",
         caller_number=None if caller is None else caller.number,
         trunk_id=campaign.trunk_id,
         template_version=campaign.template_version,
@@ -519,6 +521,7 @@ async def _place(
         compliance_hit=[{"rule": code} for code in outcome.redline_hits],
         created_by=campaign.created_by,
     )
+    reach(call, status)
     session.add(call)
     await session.flush()
     if outcome.tts_down:
