@@ -6,6 +6,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime
+from decimal import Decimal
 
 import redis.asyncio as redis_async
 from fastapi import APIRouter, Depends, Header, Request
@@ -73,6 +74,7 @@ class TenantPatch(BaseModel):
     version: int
     name: str | None = None
     daily_call_quota: int | None = Field(default=None, gt=0)
+    billing_budget: Decimal | None = Field(default=None, gt=0, max_digits=12, decimal_places=4)
 
 
 class QualificationBody(BaseModel):
@@ -389,7 +391,17 @@ async def get_tenant_route(
     tenant = await session.scalar(select(Tenant).where(Tenant.id == tenant_id))
     if tenant is None:
         raise ApiError(404, "NOT_FOUND", "tenant not found")
-    return envelope(request.state.trace_id, {"id": str(tenant.id), "name": tenant.name, "status": tenant.status, "version": tenant.version, "allowed_scenarios": tenant.allowed_scenarios})
+    return envelope(
+        request.state.trace_id,
+        {
+            "id": str(tenant.id),
+            "name": tenant.name,
+            "status": tenant.status,
+            "version": tenant.version,
+            "allowed_scenarios": tenant.allowed_scenarios,
+            "billing_budget": None if tenant.billing_budget is None else format(tenant.billing_budget, "f"),
+        },
+    )
 
 
 @platform_router.patch("/tenants/{tenant_id}")
@@ -408,9 +420,18 @@ async def patch_tenant_route(
         tenant.name = body.name
     if body.daily_call_quota is not None:
         tenant.daily_call_quota = body.daily_call_quota
+    if "billing_budget" in body.model_fields_set:
+        tenant.billing_budget = body.billing_budget
     tenant.updated_at = utcnow()
     del principal
-    return envelope(request.state.trace_id, {"id": str(tenant.id), "version": tenant.version})
+    return envelope(
+        request.state.trace_id,
+        {
+            "id": str(tenant.id),
+            "version": tenant.version,
+            "billing_budget": None if tenant.billing_budget is None else format(tenant.billing_budget, "f"),
+        },
+    )
 
 
 @platform_router.post("/tenants/{tenant_id}/qualifications")

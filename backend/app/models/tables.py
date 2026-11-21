@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     BigInteger,
@@ -14,6 +15,7 @@ from sqlalchemy import (
     Identity,
     Integer,
     LargeBinary,
+    Numeric,
     Text,
     UniqueConstraint,
     text,
@@ -39,6 +41,7 @@ class Tenant(Base):
         CheckConstraint("compliance_mode IN ('strict','custom')", name="compliance_mode"),
         CheckConstraint("max_concurrency BETWEEN 1 AND 1000", name="max_concurrency"),
         CheckConstraint("daily_call_quota > 0", name="daily_call_quota"),
+        CheckConstraint("billing_budget IS NULL OR billing_budget > 0", name="billing_budget_positive"),
     )
 
     id: Mapped[uuid.UUID] = _uuid()
@@ -51,6 +54,7 @@ class Tenant(Base):
     )
     max_concurrency: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("2"))
     daily_call_quota: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("200"))
+    billing_budget: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
     compliance_mode: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'strict'"))
     rls_bypass: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     timezone: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'Asia/Shanghai'"))

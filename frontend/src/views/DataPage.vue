@@ -7,7 +7,7 @@
       <div v-if="overview && items[0]" class="metrics">
         <div v-for="column in columns" :key="column" class="metric">
           <span>{{ labelOf(column) }}</span>
-          <strong>{{ formatCell(column, items[0][column]) }}</strong>
+          <strong :class="{ formula: column === 'formula' }">{{ formatCell(column, items[0][column]) }}</strong>
         </div>
       </div>
       <el-table v-else :data="items" style="width: 100%">
@@ -34,7 +34,7 @@ const stale = ref("");
 const items = ref([]);
 const title = computed(() => route.meta.title || "列表");
 const canExport = computed(() => route.path === "/t/reports" && session.role === "tenant_admin");
-const overview = computed(() => route.path === "/t/reports");
+const overview = computed(() => route.path === "/t/reports" || route.path === "/t/billing");
 const columns = computed(() => Object.keys(items.value[0] || {}));
 const labels = {
   calls: "呼叫",
@@ -56,6 +56,16 @@ const labels = {
   dnd_blocks: "DND 拦截",
   unquoted_items: "未报价明细",
   degraded: "呼叫降级",
+  item_count: "明细笔数",
+  amount: "金额",
+  currency: "币种",
+  rate_status: "报价状态",
+  formula: "计费公式",
+  billing_budget: "月度上限",
+  month: "账期",
+  month_quoted: "本月已报价",
+  month_unquoted: "本月未报价笔数",
+  new_tasks_paused: "新任务已暂停",
 };
 
 function labelOf(column) {
@@ -162,7 +172,12 @@ watch(() => route.fullPath, () => load(0), { immediate: true });
   margin-top: 6px;
   font-size: 20px;
   font-weight: 500;
-  word-break: break-all;
+  overflow-wrap: anywhere;
+}
+.metric strong.formula {
+  font-size: 13px;
+  line-height: 1.5;
+  font-weight: 400;
 }
 @media (max-width: 800px) {
   .metrics {

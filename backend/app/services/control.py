@@ -54,6 +54,7 @@ from app.models.extra import (
 from app.security.crypto import PhoneInvalidError, encrypt_phone, mask_phone, normalize_phone, phone_hash
 from app.security.jwt_codec import REFRESH_TTL, decode, issue
 from app.security.passwords import hash_password, verify_password
+from app.services.billing_budget import apply_billing_budget, month_spend
 from app.services.dialer import dial_pending, ensure_initial_tasks, schedule_retries
 
 _WINDOW = __import__("re").compile(r"^([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d$")
@@ -504,13 +505,16 @@ async def start_campaign(
 ) -> dict[str, object]:
     if campaign.status not in {"approved", "running"}:
         raise ApiError(409, "CONFLICT", "campaign is not approved")
-    existing = int(await session.scalar(select(func.count()).select_from(Task).where(Task.campaign_id == campaign.id)) or 0)
-    if campaign.status == "running" and existing:
-        return {"campaign_id": str(campaign.id), "task_count": existing, "idempotent": True, "started": 0}
     tenant = await session.scalar(select(Tenant).where(Tenant.id == campaign.tenant_id))
     trunk = await session.scalar(select(Trunk).where(Trunk.id == campaign.trunk_id))
     if tenant is None or trunk is None:
         raise ApiError(404, "NOT_FOUND", "campaign dependencies missing")
+    moment = now or utcnow()
+    if await apply_billing_budget(session, tenant, moment):
+        raise ApiError(409, "CONFLICT", "billing budget reached")
+    existing = int(await session.scalar(select(func.count()).select_from(Task).where(Task.campaign_id == campaign.id)) or 0)
+    if campaign.status == "running" and existing:
+        return {"campaign_id": str(campaign.id), "task_count": existing, "idempotent": True, "started": 0}
     campaign.status = "running"
     campaign.created_by = campaign.created_by or user_id
     created = await ensure_initial_tasks(session, campaign)
@@ -521,7 +525,7 @@ async def start_campaign(
         trunk=trunk,
         settings=settings,
         redis=redis,
-        now=now or utcnow(),
+        now=moment,
         heard=heard,
     )
     total = int(await session.scalar(select(func.count()).select_from(Task).where(Task.campaign_id == campaign.id)) or 0)
@@ -754,12 +758,19 @@ async def billing_summary(session: AsyncSession, tenant_id: uuid.UUID) -> dict[s
     items = (await session.scalars(select(BillingItem).where(BillingItem.tenant_id == tenant_id))).all()
     quoted = [item.amount for item in items if item.amount is not None]
     amount = format(sum(quoted), "f") if quoted and len(quoted) == len(items) else None
+    tenant = await session.scalar(select(Tenant).where(Tenant.id == tenant_id))
+    spend = await month_spend(session, tenant, utcnow()) if tenant is not None else None
     return {
         "item_count": len(items),
         "amount": amount,
         "currency": "CNY",
         "rate_status": "quoted" if amount is not None and items else "unquoted",
         "formula": "单通成本 = 线路分钟价×平均时长 + ASR分钟价×分钟数 + TTS分钟价×合成分钟 + LLM token价×单通token + 基础设施月费/月通话数 + 号码月租/月通话数",
+        "billing_budget": None if spend is None or spend.budget is None else format(spend.budget, "f"),
+        "month": None if spend is None else spend.label,
+        "month_quoted": None if spend is None else format(spend.quoted, "f"),
+        "month_unquoted": 0 if spend is None else spend.unquoted,
+        "new_tasks_paused": False if spend is None else spend.reached,
     }
 
 

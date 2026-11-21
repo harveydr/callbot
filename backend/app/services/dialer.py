@@ -30,6 +30,7 @@ from app.models.extra import (
     ScriptNode,
     Transcript,
 )
+from app.services.billing_budget import apply_billing_budget
 from app.services.tokens import TokenBucket
 from app.voice.circuit import CircuitPort, SharedVendorCircuit
 from app.voice.orchestrator import Frame, run_session
@@ -139,6 +140,8 @@ async def dial_pending(
     ).all()
     started = 0
     for task in tasks:
+        if await apply_billing_budget(session, tenant, moment):
+            break
         if started >= campaign.max_concurrency:
             break
         contact = await session.scalar(select(Contact).where(Contact.id == task.contact_id))
@@ -192,6 +195,10 @@ async def dial_pending(
 async def schedule_retries(session: AsyncSession, campaign: Campaign, now: datetime) -> int:
     if campaign.status != "running":
         return 0
+    moment = _aware(now)
+    tenant = await session.scalar(select(Tenant).where(Tenant.id == campaign.tenant_id))
+    if tenant is not None and await apply_billing_budget(session, tenant, moment):
+        return 0
     raw_max = campaign.retry_policy.get("max_retry", 0)
     max_retry = raw_max if isinstance(raw_max, int) else int(str(raw_max))
     calls = (
@@ -213,7 +220,7 @@ async def schedule_retries(session: AsyncSession, campaign: Campaign, now: datet
                 contact_id=call.contact_id,
                 attempt_no=len(attempts) + 1,
                 status="pending",
-                next_run_at=_aware(now) + _retry_delay(campaign.retry_policy, len(attempts)),
+                next_run_at=moment + _retry_delay(campaign.retry_policy, len(attempts)),
             )
         )
         created += 1
