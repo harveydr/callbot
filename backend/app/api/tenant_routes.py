@@ -29,6 +29,7 @@ from app.api.surface import (
     finish,
     tenant_router,
 )
+from app.db import set_tenant
 from app.deps import Principal, current_principal, db_session, require_roles, require_tenant
 from app.errors import ApiError
 from app.models import Call, CallEvent, CallerNumber, Campaign, ConsentRecord, Contact, ContactList, DndEntry, ScenarioTemplate, Task, Tenant, Trunk
@@ -44,7 +45,8 @@ from app.services.control import (
     billing_summary,
     build_evidence,
     bump,
-    import_contacts,
+    accept_import,
+    run_import_job,
     job_payload,
     load_turns,
     open_complaint,
@@ -217,7 +219,20 @@ async def import_list(
     content = await file.read()
     if len(content) > 50 * 1024 * 1024:
         raise ApiError(400, "BAD_REQUEST", "file is larger than 50MB")
-    job = await import_contacts(session, tenant_id=contact_list.tenant_id, contact_list=contact_list, content=content, settings=request.app.state.settings)
+    job = await accept_import(session, tenant_id=contact_list.tenant_id, contact_list=contact_list, content=content)
+    if job.status != "done" and request.app.state.settings.celery_enqueue:
+        await session.commit()
+        await set_tenant(session, contact_list.tenant_id)
+        from app.tasks.imports import import_contacts_task
+
+        try:
+            import_contacts_task.delay(str(job.id))
+        except Exception as exc:
+            job.status = "failed"
+            contact_list.import_status = "failed"
+            raise ApiError(503, "UNAVAILABLE", "import queue is unavailable") from exc
+    elif job.status != "done":
+        job = await run_import_job(session, job.id, request.app.state.settings)
     return JSONResponse(status_code=202, content=envelope(request.state.trace_id, job_payload(job)))
 
 

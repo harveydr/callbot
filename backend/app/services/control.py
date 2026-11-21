@@ -5,8 +5,10 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import os
 import secrets
 import uuid
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import TypeVar
@@ -295,15 +297,30 @@ async def create_tenant(session: AsyncSession, *, name: str, code: str, trace_id
     return {"id": str(tenant.id), "status": tenant.status, "code": tenant.code}
 
 
-async def import_contacts(
+def _import_file(job_id: uuid.UUID) -> Path:
+    root = Path(os.environ.get("IMPORT_DIR", "tmp/imports"))
+    root.mkdir(parents=True, exist_ok=True)
+    return root / f"{job_id}.csv"
+
+
+async def accept_import(
     session: AsyncSession,
     *,
     tenant_id: uuid.UUID,
     contact_list: ContactList,
     content: bytes,
-    settings: Settings,
 ) -> ImportJob:
+    """Store the upload and return. Parsing happens in run_import_job."""
     digest = hashlib.md5(content).hexdigest()
+    current = await session.scalar(
+        select(ImportJob).where(
+            ImportJob.list_id == contact_list.id,
+            ImportJob.file_md5 == digest,
+            ImportJob.status == "running",
+        )
+    )
+    if current is not None:
+        return current
     previous = await session.scalar(
         select(ImportJob).where(
             ImportJob.list_id == contact_list.id,
@@ -313,6 +330,83 @@ async def import_contacts(
     )
     if previous is not None:
         return previous
+    if contact_list.import_status == "running":
+        raise ApiError(409, "CONFLICT", "import already running")
+    job = ImportJob(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        list_id=contact_list.id,
+        file_md5=digest,
+        status="running",
+        errors=[],
+        payload=content,
+    )
+    session.add(job)
+    contact_list.import_status = "running"
+    await session.flush()
+    try:
+        _import_file(job.id).write_bytes(content)
+    except OSError:
+        pass
+    return job
+
+
+async def run_import_job(session: AsyncSession, job_id: uuid.UUID, settings: Settings) -> ImportJob:
+    job = await session.scalar(select(ImportJob).where(ImportJob.id == job_id))
+    if job is None:
+        raise ApiError(404, "NOT_FOUND", "import not found")
+    if job.status == "done":
+        return job
+    contact_list = await session.scalar(select(ContactList).where(ContactList.id == job.list_id))
+    if contact_list is None:
+        raise ApiError(404, "NOT_FOUND", "list not found")
+    content = job.payload
+    if content is not None and not isinstance(content, bytes):
+        content = bytes(content)
+    spool = _import_file(job.id)
+    if content is None and spool.exists():
+        content = spool.read_bytes()
+    if not content:
+        job.status = "failed"
+        contact_list.import_status = "failed"
+        await session.flush()
+        return job
+    try:
+        await _parse_import(session, job=job, contact_list=contact_list, content=content, settings=settings)
+    except Exception:
+        job.status = "failed"
+        contact_list.import_status = "failed"
+        await session.flush()
+        raise
+    job.payload = None
+    if spool.exists():
+        spool.unlink()
+    return job
+
+
+async def import_contacts(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    contact_list: ContactList,
+    content: bytes,
+    settings: Settings,
+) -> ImportJob:
+    job = await accept_import(session, tenant_id=tenant_id, contact_list=contact_list, content=content)
+    if job.status == "done":
+        return job
+    return await run_import_job(session, job.id, settings)
+
+
+async def _parse_import(
+    session: AsyncSession,
+    *,
+    job: ImportJob,
+    contact_list: ContactList,
+    content: bytes,
+    settings: Settings,
+) -> None:
+    tenant_id = job.tenant_id
     consent_rows = (
         await session.scalars(
             select(ConsentRecord.phone_hash).where(
@@ -330,9 +424,6 @@ async def import_contacts(
         row.phone_hash: row
         for row in (await session.scalars(select(Contact).where(Contact.list_id == contact_list.id))).all()
     }
-    job = ImportJob(tenant_id=tenant_id, list_id=contact_list.id, file_md5=digest, status="running", errors=[])
-    session.add(job)
-    await session.flush()
     text = content.decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(text))
     errors: list[object] = []
@@ -384,8 +475,7 @@ async def import_contacts(
     job.invalid_format = counts["invalid_format"]
     job.errors = errors
     contact_list.import_status = "done"
-    contact_list.file_md5 = digest
-    return job
+    contact_list.file_md5 = job.file_md5
 
 
 def job_payload(job: ImportJob) -> dict[str, object]:

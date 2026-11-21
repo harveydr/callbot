@@ -25,6 +25,8 @@ services:
       context: ..
       dockerfile: backend/Dockerfile
     env_file: ../.env
+    environment:
+      CELERY_ENQUEUE: "true"
     depends_on:
       db:
         condition: service_healthy

@@ -56,4 +56,5 @@ app = celery_app
 
 from app.tasks import billing_schedule as billing_schedule_task  # noqa: E402,F401
 from app.tasks import dispatch as dispatch_task  # noqa: E402,F401
+from app.tasks import imports as import_task  # noqa: E402,F401
 from app.tasks import qualification as qualification_task  # noqa: E402,F401

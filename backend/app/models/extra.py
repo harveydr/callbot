@@ -13,6 +13,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    LargeBinary,
     Numeric,
     Text,
     UniqueConstraint,
@@ -279,6 +280,7 @@ class ImportJob(Base):
     dnd_hit: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     invalid_format: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     errors: Mapped[list[object]] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    payload: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     created_at: Mapped[datetime] = _ts()
 
 
