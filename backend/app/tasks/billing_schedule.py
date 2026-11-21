@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from app.config import load_settings
 from app.db import make_engine, make_session_factory, set_bypass
 from app.tasks import celery_app
-from app.tasks.billing import reconcile_previous_day
+from app.tasks.billing import probe_missing_cdr, reconcile_previous_day, unavailable_cdr
 
 
 async def _run_reconcile() -> str:
@@ -25,6 +25,25 @@ async def _run_reconcile() -> str:
         await engine.dispose()
 
 
+async def _run_probe() -> str:
+    settings = load_settings()
+    engine = make_engine(settings.database_url)
+    factory = make_session_factory(engine)
+    try:
+        async with factory() as session:
+            await set_bypass(session)
+            probed = await probe_missing_cdr(session, datetime.now(timezone.utc), unavailable_cdr)
+            await session.commit()
+            return f"probes:{probed}"
+    finally:
+        await engine.dispose()
+
+
 @celery_app.task(name="billing_reconcile")
 def billing_reconcile_task() -> str:
     return asyncio.run(_run_reconcile())
+
+
+@celery_app.task(name="probe_missing_cdr")
+def probe_missing_cdr_task() -> str:
+    return asyncio.run(_run_probe())

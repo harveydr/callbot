@@ -28,12 +28,17 @@ celery_app.conf.update(
             "task": "dispatch_due_campaigns",
             "schedule": timedelta(minutes=1),
         },
+        "probe-missing-cdr": {
+            "task": "probe_missing_cdr",
+            "schedule": timedelta(minutes=1),
+        },
     },
     task_routes={
         "dispatch_campaign": {"queue": "dispatch"},
         "dispatch_due_campaigns": {"queue": "dispatch"},
         "import_contacts": {"queue": "io_heavy"},
         "billing_reconcile": {"queue": "billing"},
+        "probe_missing_cdr": {"queue": "billing"},
         "render_report": {"queue": "report"},
         "sweep_qualifications": {"queue": "dispatch"},
     },
@@ -43,6 +48,7 @@ celery_app.conf.update(
         "sweep_qualifications": {"time_limit": 60},
         "import_contacts": {"time_limit": 600},
         "billing_reconcile": {"time_limit": 120},
+        "probe_missing_cdr": {"time_limit": 120},
         "render_report": {"time_limit": 300},
     },
 )

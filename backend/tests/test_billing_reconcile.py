@@ -15,7 +15,14 @@ from app.models.extra import Alert, BillingDispute, BillingItem
 from app.security.crypto import encrypt_phone, phone_hash
 from app.services.exports import export_expires_at, export_is_usable
 from app.tasks import celery_app
-from app.tasks.billing import VendorCdr, apply_vendor_cdr, duration_gap, reconcile_previous_day, reconcile_vendor_bill
+from app.tasks.billing import (
+    VendorCdr,
+    apply_vendor_cdr,
+    duration_gap,
+    probe_missing_cdr,
+    reconcile_previous_day,
+    reconcile_vendor_bill,
+)
 
 NOW = datetime(2026, 11, 22, 2, 0, tzinfo=timezone.utc)
 KEY = __import__("base64").b64decode("AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=")
@@ -338,6 +345,95 @@ def test_vendor_bill_reconcile_is_scheduled_at_two() -> None:
     assert celery_app.conf.timezone == "Asia/Shanghai"
     assert entry["schedule"].hour == {2}
     assert entry["schedule"].minute == {0}
+
+
+async def _no_cdr(_call: Call) -> VendorCdr | None:
+    return None
+
+
+async def test_missing_cdr_is_probed_three_times_without_changing_the_price(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        call = await _call(session, amount=Decimal("1.2500"))
+        call.duration_sec = 30
+        call.end_at = NOW - timedelta(seconds=10)
+        await session.flush()
+        too_soon = await probe_missing_cdr(session, NOW, _no_cdr)
+        call.end_at = NOW - timedelta(seconds=200)
+        await session.flush()
+        first = await probe_missing_cdr(session, NOW, _no_cdr)
+        second = await probe_missing_cdr(session, NOW, _no_cdr)
+        third = await probe_missing_cdr(session, NOW, _no_cdr)
+        fourth = await probe_missing_cdr(session, NOW, _no_cdr)
+        item = await session.scalar(select(BillingItem).where(BillingItem.call_uuid == call.call_uuid))
+        dispute = await session.scalar(select(BillingDispute).where(BillingDispute.tenant_id == call.tenant_id))
+        probes = (
+            await session.scalars(select(CallEvent).where(CallEvent.call_id == call.id, CallEvent.event_type == "cdr_probe"))
+        ).all()
+        assert too_soon == 0
+        assert (first, second, third, fourth) == (1, 1, 1, 0)
+        assert sorted(row.detail.get("attempt") for row in probes) == [1, 2, 3]
+        assert item is not None and item.amount == Decimal("1.2500") and call.duration_sec == 30
+        assert dispute is not None and dispute.reason == "cdr_unavailable"
+
+
+async def test_cdr_probe_applies_a_returned_vendor_row(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        found = await _call(session, amount=Decimal("1.0000"))
+        found.duration_sec = 30
+        found.end_at = NOW - timedelta(seconds=45)
+        known = await _call(session, amount=Decimal("2.0000"))
+        known.duration_sec = 30
+        known.end_at = NOW - timedelta(seconds=45)
+        stale = await _call(session, amount=Decimal("3.0000"))
+        stale.end_at = NOW - timedelta(hours=25)
+        await session.flush()
+        session.add(
+            CallEvent(
+                tenant_id=known.tenant_id,
+                call_id=known.id,
+                event_type="cdr_applied",
+                detail={"vendor_event_id": "already"},
+            )
+        )
+        await session.flush()
+
+        async def lookup(call: Call) -> VendorCdr | None:
+            if call.id == found.id:
+                return VendorCdr("evt-probe", 30, None)
+            return None
+
+        probed = await probe_missing_cdr(session, NOW, lookup)
+        again = await probe_missing_cdr(session, NOW, lookup)
+        applied = await session.scalar(
+            select(CallEvent.id).where(CallEvent.call_id == found.id, CallEvent.event_type == "cdr_applied")
+        )
+        known_probes = await session.scalar(
+            select(func.count()).select_from(CallEvent).where(CallEvent.call_id == known.id, CallEvent.event_type == "cdr_probe")
+        )
+        stale_probes = await session.scalar(
+            select(func.count()).select_from(CallEvent).where(CallEvent.call_id == stale.id, CallEvent.event_type == "cdr_probe")
+        )
+        dispute = await session.scalar(select(BillingDispute.id).where(BillingDispute.tenant_id == found.tenant_id))
+        item = await session.scalar(select(BillingItem).where(BillingItem.call_uuid == found.call_uuid))
+        assert probed == 1
+        assert again == 0
+        assert applied is not None
+        assert known_probes == 0
+        assert stale_probes == 0
+        assert dispute is None
+        assert item is not None and item.amount == Decimal("1.0000")
+
+
+def test_missing_cdr_probe_runs_every_minute() -> None:
+    entry = celery_app.conf.beat_schedule["probe-missing-cdr"]
+    assert entry["task"] == "probe_missing_cdr"
+    assert entry["schedule"] == timedelta(minutes=1)
+    assert celery_app.conf.task_routes["probe_missing_cdr"]["queue"] == "billing"
+    assert celery_app.conf.task_annotations["probe_missing_cdr"]["time_limit"] == 120
 
 
 def test_export_link_expires_after_fifteen_minutes() -> None:

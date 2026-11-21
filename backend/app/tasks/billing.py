@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -239,3 +240,67 @@ async def reconcile_previous_day(session: AsyncSession, now: datetime) -> int:
             now=moment,
         )
     return opened
+
+
+_PROBE_AFTER = (timedelta(seconds=30), timedelta(seconds=60), timedelta(seconds=180))
+_PROBE_STATUSES = ("answered", "completed", "transfer_failed")
+CdrLookup = Callable[[Call], Awaitable[VendorCdr | None]]
+
+
+async def unavailable_cdr(_call: Call) -> VendorCdr | None:
+    """No trunk is configured, so a probe cannot invent a duration or a price."""
+    return None
+
+
+async def probe_missing_cdr(session: AsyncSession, now: datetime, lookup: CdrLookup) -> int:
+    """Query a missing vendor CDR at 30s, 60s, and 180s. The third miss opens a dispute."""
+    moment = _aware(now)
+    earliest = moment - timedelta(hours=24)
+    calls = (
+        await session.scalars(
+            select(Call).where(
+                Call.status.in_(_PROBE_STATUSES),
+                Call.end_at.is_not(None),
+                Call.end_at >= earliest,
+                Call.end_at <= moment - _PROBE_AFTER[0],
+            )
+        )
+    ).all()
+    probed = 0
+    for call in calls:
+        applied = await session.scalar(
+            select(CallEvent.id)
+            .where(CallEvent.call_id == call.id, CallEvent.event_type == "cdr_applied")
+            .limit(1)
+        )
+        if applied is not None:
+            continue
+        prior = (
+            await session.scalars(
+                select(CallEvent).where(CallEvent.call_id == call.id, CallEvent.event_type == "cdr_probe")
+            )
+        ).all()
+        attempt = len(prior)
+        if attempt >= len(_PROBE_AFTER):
+            continue
+        anchor = call.end_at
+        if anchor is None or moment < _aware(anchor) + _PROBE_AFTER[attempt]:
+            continue
+        found = await lookup(call)
+        session.add(
+            CallEvent(
+                tenant_id=call.tenant_id,
+                call_id=call.id,
+                event_type="cdr_probe",
+                detail={"attempt": attempt + 1, "found": found is not None},
+                created_at=moment,
+            )
+        )
+        probed += 1
+        if found is not None:
+            await apply_vendor_cdr(session, call=call, cdr=found, now=moment)
+        elif attempt + 1 == len(_PROBE_AFTER):
+            item = await session.scalar(select(BillingItem).where(BillingItem.call_uuid == call.call_uuid))
+            await _open_dispute(session, call=call, item=item, reason="cdr_unavailable", now=moment)
+    await session.flush()
+    return probed
