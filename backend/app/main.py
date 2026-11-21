@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator
 from typing import Any, cast
 from contextlib import asynccontextmanager
 
+import jwt
 import redis.asyncio as redis_async
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.exceptions import RequestValidationError
@@ -19,6 +20,8 @@ from fastapi.responses import JSONResponse
 from app.api import tenant_routes as _tenant_routes  # noqa: F401
 from app.api.surface import auth_router, envelope, platform_router, tenant_router
 from app.config import Settings, load_settings
+from app.security.jwt_codec import decode
+from app.security.rate_limit import LOGIN_RPS, TENANT_WRITE_RPS, USER_RPS, login_key, reserve, user_key, write_key
 from app.services.control import utcnow
 from app.services.ops_alerts import record_http
 from app.db import make_engine, make_session_factory
@@ -44,6 +47,56 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await engine.dispose()
 
 
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-real-ip", "").strip()
+    if forwarded:
+        return forwarded
+    if request.client is not None and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+async def _rate_limit(request: Request, trace_id: str) -> JSONResponse | None:
+    if not request.url.path.startswith("/api/"):
+        return None
+    client = getattr(request.app.state, "redis", None)
+    if client is None:
+        return None
+    settings: Settings = request.app.state.settings
+    if request.method == "POST" and request.url.path == "/api/auth/login":
+        wait = await reserve(client, login_key(_client_ip(request)), LOGIN_RPS)
+        if wait:
+            return _limited(trace_id, wait)
+    header = request.headers.get("authorization", "")
+    if not header.lower().startswith("bearer "):
+        return None
+    try:
+        claims = decode(header.split(" ", 1)[1].strip(), settings.jwt_secret, expected_typ="access")
+    except jwt.InvalidTokenError:
+        return None
+    subject = str(claims.get("sub") or "")
+    if subject:
+        wait = await reserve(client, user_key(subject), USER_RPS)
+        if wait:
+            return _limited(trace_id, wait)
+    tenant_id = claims.get("tenant_id")
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and isinstance(tenant_id, str) and tenant_id:
+        wait = await reserve(client, write_key(tenant_id), TENANT_WRITE_RPS)
+        if wait:
+            return _limited(trace_id, wait)
+    return None
+
+
+def _limited(trace_id: str, wait: int) -> JSONResponse:
+    response = JSONResponse(
+        status_code=429,
+        content=envelope(trace_id, {}, code="RATE_LIMITED", message="too many requests"),
+    )
+    response.headers["Retry-After"] = str(wait)
+    response.headers["X-Request-ID"] = trace_id
+    return response
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved = settings or load_settings()
     docs = "/docs" if resolved.app_env == "dev" else None
@@ -62,6 +115,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def context(request: Request, call_next):  # type: ignore[no-untyped-def]
         trace_id = request.headers.get("x-request-id") or str(uuid.uuid4())
         request.state.trace_id = trace_id
+        limited = await _rate_limit(request, trace_id)
+        if limited is not None:
+            return limited
         if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
             raw = await request.body()
             content_type = request.headers.get("content-type", "")

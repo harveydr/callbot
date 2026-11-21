@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -93,6 +94,7 @@ async def test_login_success_and_lockout(client: AsyncClient, session_factory: a
     for _ in range(4):
         failed = await login(client, "lock-user", "wrong-password")
         assert failed["status"] == 401
+    await asyncio.sleep(1.1)
     locked = await login(client, "lock-user", "wrong-password")
     assert locked["status"] == 423
     still = await login(client, "lock-user", PASSWORD)
