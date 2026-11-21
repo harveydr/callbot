@@ -673,7 +673,15 @@ async def get_call(
             "status": call.status,
             "template_version": call.template_version,
             "turns": turns,
-            "summary": summary,
+            "summary": call.summary if call.summary is not None else summary,
+            "duration_sec": call.duration_sec,
+            "ai_duration_sec": call.ai_duration_sec,
+            "human_duration_sec": call.human_duration_sec,
+            "turn_count": call.turn_count,
+            "barge_in_count": call.barge_in_count,
+            "latency_p50_ms": call.latency_p50_ms,
+            "latency_p95_ms": call.latency_p95_ms,
+            "cdr": call.cdr,
         },
     )
 

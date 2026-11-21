@@ -341,6 +341,15 @@ async def test_stop_request_during_dial_writes_dnd(
         assert call is not None
         assert call.status == "completed"
         assert call.intent_grade == "D"
+        assert call.duration_sec == 30
+        assert call.ai_duration_sec == 30
+        assert call.human_duration_sec == 0
+        assert call.turn_count >= 2
+        assert call.barge_in_count == 1
+        assert call.latency_p50_ms == call.latency_p95_ms
+        assert call.latency_p50_ms is not None and call.latency_p50_ms >= 0
+        assert call.summary is not None and len(call.summary) <= 60
+        assert call.cdr is None
 
 
 async def test_tts_429_schedules_a_callback_without_dropping_the_opening() -> None:

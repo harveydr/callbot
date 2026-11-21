@@ -537,6 +537,12 @@ async def _place(
         answer_at=now if status == "completed" else None,
         end_at=now,
         duration_sec=0 if status != "completed" else 30,
+        ai_duration_sec=0 if status != "completed" else 30,
+        human_duration_sec=0,
+        turn_count=len(outcome.turns),
+        barge_in_count=1 if outcome.barged_in else 0,
+        latency_p50_ms=round(outcome.latency_ms),
+        latency_p95_ms=round(outcome.latency_ms),
         intent_grade=outcome.intent_grade,
         compliance_hit=[{"rule": code} for code in outcome.redline_hits],
         created_by=campaign.created_by,
@@ -643,6 +649,7 @@ async def _place(
             created_by=campaign.created_by,
         )
     )
+    call.summary = review.summary
     session.add(
         QcResult(
             tenant_id=campaign.tenant_id,
