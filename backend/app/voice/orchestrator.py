@@ -171,6 +171,15 @@ def _fallback_ms(script: list[dict[str, object]] | None) -> int:
     return 0
 
 
+def _silence_episodes(silence_ms: int, timeout_ms: int, silent: bool) -> int:
+    """How many times this silence has crossed the node limit. A missing limit counts as one."""
+    if not silent:
+        return 0
+    if timeout_ms <= 0:
+        return 1
+    return silence_ms // timeout_ms
+
+
 def caller_frames(heard: str, script: list[dict[str, object]] | None) -> list[Frame]:
     """Map a dial result to media frames. Silence lasts for the node's own time limit."""
     if heard == "无人接听":
@@ -297,8 +306,9 @@ async def run_session(
     heard = strip_injection("".join(heard_parts))
     timeout_ms = _fallback_ms(script)
     silent = silence_frames > 0 and not heard
-    no_input = silent and silence_ms >= timeout_ms
-    hold = silent and not no_input
+    episodes = _silence_episodes(silence_ms, timeout_ms, silent)
+    no_input = episodes >= 1
+    hold = silent and episodes == 0
     clock = llm_clock or time.perf_counter
     llm_started = clock()
     if llm_mode == "down" and not no_input and not hold:
@@ -372,7 +382,7 @@ async def run_session(
         reply = opening + script_body
     else:
         action, reply = _reply(intent, opening)
-    if no_input and prior_silence >= 1:
+    if no_input and episodes + prior_silence >= 2:
         bye = _node_text(script, "n_bye") or _BYE
         action = "hangup"
         reply = f"{opening}{bye}"

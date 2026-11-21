@@ -501,6 +501,20 @@ async def test_silence_clarifies_once_and_then_says_goodbye() -> None:
         prior_silence=1,
         llm_mode="down",
     )
+    same_call = await run_session(
+        [Frame("caller", b"SILENCE", duration_ms=4000), Frame("caller", b"SILENCE", duration_ms=4000)],
+        company="回声",
+        purpose="通知",
+        script=script,
+        llm_mode="down",
+    )
+    almost = await run_session(
+        [Frame("caller", b"SILENCE", duration_ms=7999)],
+        company="回声",
+        purpose="通知",
+        script=script,
+        llm_mode="down",
+    )
     assert first.action == "speak"
     assert "没有听清" in first.reply_text
     assert "必须播报的开场要点。" in first.reply_text
@@ -514,6 +528,14 @@ async def test_silence_clarifies_once_and_then_says_goodbye() -> None:
     assert "不再打扰" not in early.reply_text
     assert "标准流程" not in early.reply_text
     assert opening_is_complete(early.reply_text)
+    assert same_call.action == "hangup"
+    assert same_call.reply_text.endswith("不再打扰。")
+    assert "没有听清" not in same_call.reply_text
+    assert "标准流程" not in same_call.reply_text
+    assert opening_is_complete(same_call.reply_text)
+    assert almost.action == "speak"
+    assert "没有听清" in almost.reply_text
+    assert "不再打扰" not in almost.reply_text
 
 
 async def test_a_slow_model_plays_the_filler_after_the_opening() -> None:
