@@ -640,6 +640,15 @@ async def _place(
             detail={"played": True},
         )
     )
+    if outcome.script_tree:
+        session.add(
+            CallEvent(
+                tenant_id=campaign.tenant_id,
+                call_id=call.id,
+                event_type="script_tree",
+                detail={"mode": "script_tree"},
+            )
+        )
     if outcome.llm_format_error:
         session.add(
             CallEvent(

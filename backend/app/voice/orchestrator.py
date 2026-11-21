@@ -23,6 +23,7 @@ _SCRIPT_MODE = "我用标准流程为您解答。"
 _TTS_CALLBACK = "稍后为您回拨。"
 _FILLER = "嗯，我帮您看下哈。"
 _FILLER_AFTER_MS = 400.0
+_SCRIPT_AFTER_MS = 3000.0
 _CLARIFY = "您好，我没有听清，方便的话请再说一次。"
 _FORMAT_CLARIFY = "不好意思，我再确认一下您的意思。"
 _BYE = "那先不打扰您了。"
@@ -65,6 +66,7 @@ class Outcome:
     intent_confidence: float = 0.5
     ask_human: bool = False
     demand_stop: bool = False
+    script_tree: bool = False
 
 
 def strip_injection(text: str) -> str:
@@ -105,7 +107,7 @@ def _confidence(parsed: dict[str, object] | None) -> float:
     return value
 
 
-def _payloads(llm_mode: str, heard: str) -> list[str]:
+def _payloads(llm_mode: str, heard: str) -> list[str | None]:
     if llm_mode == "bad_json":
         return ["NOT_JSON", "{"]
     if llm_mode == "bad_then_ok":
@@ -129,6 +131,10 @@ def _payloads(llm_mode: str, heard: str) -> list[str]:
         return [json.dumps({"intent": "inquiry", "ask_human": True}, ensure_ascii=False)]
     if llm_mode == "flagged_text":
         return [json.dumps({"intent": "inquiry", "demand_stop": "true", "ask_human": "true"}, ensure_ascii=False)]
+    if llm_mode == "fail_twice":
+        return [None, None]
+    if llm_mode == "fail_then_ok":
+        return [None, json.dumps({"intent": "agree"}, ensure_ascii=False)]
     return [json.dumps({"intent": classify_intent(heard)}, ensure_ascii=False)]
 
 
@@ -291,6 +297,7 @@ async def run_session(
     confidence = 0.5
     ask_human = False
     demand_stop = False
+    script_tree = False
     if no_input or hold:
         intent = "invalid"
     elif llm_down:
@@ -298,7 +305,12 @@ async def run_session(
         degraded = True
     else:
         parsed: dict[str, object] | None = None
+        vendor_failures = 0
         for raw in _payloads(llm_mode, heard):
+            if raw is None:
+                vendor_failures += 1
+                llm_circuit.observe(503)
+                continue
             parsed = _object(raw)
             if parsed is not None:
                 break
@@ -324,6 +336,21 @@ async def run_session(
                 demand_stop = parsed.get("demand_stop") is True if parsed is not None else False
         confidence = 0.5 if format_error else _confidence(parsed)
         llm_first_token_ms = (clock() - llm_started) * 1000
+        if vendor_failures >= 2 and parsed is None:
+            script_tree = True
+            intent = classify_intent(heard)
+            format_error = False
+            model_say = ""
+            ask_human = False
+            demand_stop = False
+            degraded = True
+        elif llm_first_token_ms > _SCRIPT_AFTER_MS and parsed is not None and llm_mode != "hostile":
+            script_tree = True
+            intent = classify_intent(heard)
+            model_say = ""
+            ask_human = False
+            demand_stop = False
+            degraded = True
     script_body, script_action, mandatory = render_script(
         parse_nodes(script), intent=intent, require_guardian=require_guardian
     )
@@ -359,7 +386,7 @@ async def run_session(
         action = "transfer"
         if _HUMAN_LINE not in guarded:
             guarded = f"{guarded}{_HUMAN_LINE}"
-    if llm_down and _SCRIPT_MODE not in guarded:
+    if (llm_down or script_tree) and _SCRIPT_MODE not in guarded:
         guarded = f"{opening}{_SCRIPT_MODE}{guarded.removeprefix(opening)}"
     if tts_down:
         action = "hangup"
@@ -382,7 +409,7 @@ async def run_session(
         action=action,
         barged_in=playback.barged_in,
         voicemail=intent == "voicemail",
-        degraded=degraded or circuit.open or tts_down or llm_down,
+        degraded=degraded or circuit.open or tts_down or llm_down or script_tree,
         latency_ms=elapsed,
         intent=intent,
         intent_grade=_GRADE.get(intent, "NA"),
@@ -402,4 +429,5 @@ async def run_session(
         intent_confidence=confidence,
         ask_human=ask_human,
         demand_stop=demand_stop,
+        script_tree=script_tree,
     )

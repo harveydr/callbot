@@ -29,7 +29,7 @@ from app.security.crypto import encrypt_phone, phone_hash
 from app.services.dialer import dial_pending
 from tests.test_dispatch import _world
 from app.voice.asr import MockAsr
-from app.voice.circuit import VendorCircuit
+from app.voice.circuit import SharedVendorCircuit, VendorCircuit
 from app.voice.orchestrator import Frame, run_session
 from app.voice.script import confine_to_knowledge
 from app.voice.tts import MockTts
@@ -616,6 +616,101 @@ async def test_a_model_stop_flag_writes_dnd_without_a_keyword(
     assert started == 1
     assert row is not None and row.source == "user_said_no"
     assert call is not None and call.status == "completed"
+
+
+async def test_a_late_or_twice_failed_model_uses_the_script_tree() -> None:
+    late = iter((0.0, 4.0))
+    boundary = iter((0.0, 3.0))
+    slow = await run_session(
+        [Frame("caller", "PCM:请问一下".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        llm_mode="priced",
+        llm_clock=lambda: next(late),
+        script=_priced_script("费用是 99 元，合同自动续费。"),
+    )
+    kept = await run_session(
+        [Frame("caller", "PCM:请问一下".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        llm_mode="priced",
+        llm_clock=lambda: next(boundary),
+        script=_priced_script("费用是 99 元，合同自动续费。"),
+    )
+    failed = await run_session(
+        [Frame("caller", "PCM:好的".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        llm_mode="fail_twice",
+    )
+    recovered = await run_session(
+        [Frame("caller", "PCM:好的".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        llm_mode="fail_then_ok",
+    )
+    assert slow.script_tree is True
+    assert slow.llm_first_token_ms == 4000
+    assert "99 元" not in slow.reply_text
+    assert "标准流程" in slow.reply_text
+    assert "必须播报的开场要点。" in slow.reply_text
+    assert slow.reply_text.index("人工智能") < slow.reply_text.index("嗯，我帮您看下哈。")
+    assert slow.reply_text.index("嗯，我帮您看下哈。") < slow.reply_text.index("标准流程")
+    assert opening_is_complete(slow.reply_text)
+    assert slow.needs_dnd is False
+    assert kept.script_tree is False
+    assert kept.llm_first_token_ms == 3000
+    assert "费用是 99 元，合同自动续费。" in kept.reply_text
+    assert failed.script_tree is True
+    assert failed.intent == "agree"
+    assert "标准流程" in failed.reply_text
+    assert "再确认一下" not in failed.reply_text
+    assert opening_is_complete(failed.reply_text)
+    assert recovered.script_tree is False
+    assert recovered.intent == "agree"
+    assert "标准流程" not in recovered.reply_text
+
+
+async def test_two_model_failures_mark_the_call_script_tree(
+    session_factory: async_sessionmaker[AsyncSession], redis_client
+) -> None:
+    settings = load_settings()
+    circuit = SharedVendorCircuit(settings.redis_url, "llm")
+    try:
+        async with session_factory() as session:
+            await set_bypass(session)
+            tenant, trunk, campaign, contact, _caller = await _world(session, "script-tree", phone="13800006783")
+            session.add(
+                Task(tenant_id=tenant.id, campaign_id=campaign.id, contact_id=contact.id, attempt_no=1, status="pending")
+            )
+            await session.flush()
+            started = await dial_pending(
+                session,
+                campaign=campaign,
+                tenant=tenant,
+                trunk=trunk,
+                settings=settings,
+                redis=redis_client,
+                now=NOW,
+                heard="好的",
+                llm_mode="fail_twice",
+            )
+            call = await session.scalar(select(Call).where(Call.contact_id == contact.id))
+            event = (
+                await session.scalar(
+                    select(CallEvent).where(CallEvent.call_id == call.id, CallEvent.event_type == "script_tree")
+                )
+                if call is not None
+                else None
+            )
+            spoken = await session.scalar(select(CallTurn.text_content).where(CallTurn.speaker == "assistant"))
+        assert started == 1
+        assert campaign.status == "running"
+        assert event is not None and event.detail == {"mode": "script_tree"}
+        assert spoken is not None and "标准流程" in spoken and opening_is_complete(spoken)
+    finally:
+        circuit.reset()
+        circuit.close()
 
 
 async def test_a_format_error_is_stored_on_the_call(
