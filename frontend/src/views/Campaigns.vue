@@ -5,6 +5,7 @@
       <el-table :data="items" @row-click="open">
         <el-table-column prop="name" label="名称" />
         <el-table-column prop="status" label="状态" />
+        <el-table-column prop="voice_mode" label="模式" />
         <el-table-column prop="version" label="版本" />
       </el-table>
     </StateView>

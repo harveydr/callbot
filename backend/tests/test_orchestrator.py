@@ -28,6 +28,7 @@ from app.services.dialer import dial_pending
 from app.voice.asr import MockAsr
 from app.voice.circuit import VendorCircuit
 from app.voice.orchestrator import Frame, run_session
+from app.voice.tts import MockTts
 
 NOW = datetime(2026, 11, 22, 2, 0, tzinfo=timezone.utc)
 PHONE = "13800002222"
@@ -300,3 +301,68 @@ async def test_stop_request_during_dial_writes_dnd(
         assert call is not None
         assert call.status == "completed"
         assert call.intent_grade == "D"
+
+
+async def test_tts_429_schedules_a_callback_without_dropping_the_opening() -> None:
+    circuit = VendorCircuit()
+    speaker = MockTts(status=429)
+    first = await run_session(
+        [Frame("caller", "PCM:好的".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        tts=speaker,
+        tts_circuit=circuit,
+    )
+    second_speaker = MockTts(status=429)
+    second = await run_session(
+        [Frame("caller", "PCM:好的".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        tts=second_speaker,
+        tts_circuit=circuit,
+    )
+    assert first.tts_down is True
+    assert first.action == "hangup"
+    assert first.llm_down is False
+    assert "稍后为您回拨" in first.reply_text
+    assert opening_is_complete(first.reply_text)
+    assert speaker.calls == 1
+    assert second.tts_down is True
+    assert second_speaker.calls == 0
+
+
+async def test_llm_outage_uses_the_script_phrase_and_leaves_tts_closed() -> None:
+    llm = VendorCircuit()
+    tts = VendorCircuit()
+    llm.observe(429)
+    outcome = await run_session(
+        [Frame("caller", "PCM:好的".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        tts_circuit=tts,
+        llm_circuit=llm,
+    )
+    assert outcome.llm_down is True
+    assert outcome.tts_down is False
+    assert outcome.action == "speak"
+    assert "我用标准流程为您解答" in outcome.reply_text
+    assert opening_is_complete(outcome.reply_text)
+    assert tts.open is False
+
+
+async def test_asr_429_does_not_open_tts_or_llm() -> None:
+    asr_circuit = VendorCircuit()
+    tts_circuit = VendorCircuit()
+    llm_circuit = VendorCircuit()
+    await run_session(
+        [Frame("caller", "PCM:好的".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        asr=MockAsr(status=429),
+        circuit=asr_circuit,
+        tts_circuit=tts_circuit,
+        llm_circuit=llm_circuit,
+    )
+    assert asr_circuit.open is True
+    assert tts_circuit.open is False
+    assert llm_circuit.open is False

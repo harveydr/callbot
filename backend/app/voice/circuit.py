@@ -1,4 +1,4 @@
-"""Vendor circuit shared by ASR calls in this process.
+"""Vendor circuit shared by ASR, TTS, and LLM calls in this process.
 
 A 429 opens immediately. Other failures open after 5 in a row, or when more than half of the
 calls in the last 30 seconds failed and at least 5 calls were counted. An open circuit tries one
@@ -176,7 +176,7 @@ class CircuitPort(Protocol):
 
 
 class SharedVendorCircuit:
-    """The same ASR breaker for every worker. The clock is wall time so processes agree."""
+    """One named breaker for every worker. The clock is wall time so processes agree."""
 
     def __init__(self, redis_url: str, name: str, *, clock: Callable[[], float] | None = None) -> None:
         self._clock = clock or time.time
@@ -244,6 +244,23 @@ class SharedVendorCircuit:
             return result
         finally:
             self._client.delete(self._lock)
+
+
+def shared_voice_mode(redis_url: str) -> str:
+    """tts open pauses new calls. llm open keeps calls on the script tree. asr stays a local fallback."""
+    tts = SharedVendorCircuit(redis_url, "tts")
+    llm = SharedVendorCircuit(redis_url, "llm")
+    try:
+        if tts.open:
+            return "paused_vendor"
+        if llm.open:
+            return "script"
+        return "normal"
+    except redis.RedisError:
+        return "normal"
+    finally:
+        tts.close()
+        llm.close()
 
 
 def _payload(raw: str) -> dict[str, object]:

@@ -59,14 +59,14 @@ _REJECT_SAMPLE = 5
 _REJECT_RATE = 0.85
 
 
-def _store_circuit_alerts(session: AsyncSession, tenant_id: uuid.UUID, circuit: CircuitPort) -> None:
+def _store_circuit_alerts(session: AsyncSession, tenant_id: uuid.UUID, circuit: CircuitPort, vendor: str) -> None:
     for code, reason in circuit.drain_alerts():
         session.add(
             Alert(
                 tenant_id=tenant_id,
                 severity="warning",
                 code=code,
-                message=f"语音供应商熔断 {reason}",
+                message=f"{vendor} 供应商熔断 {reason}",
             )
         )
 
@@ -186,6 +186,8 @@ async def dial_pending(
             task.status = "failed"
             raise
         started += 1
+        if campaign.status != "running":
+            break
     for _ in range(started):
         await bucket.release(f"live:{tenant.id}")
     await _pause_if_rejected(session, campaign, moment)
@@ -459,12 +461,26 @@ async def _place(
     script: list[dict[str, object]] = []
     for row in script_rows:
         script.append({"node_key": row.node_key, "node_type": row.node_type, "content": row.content})
-    circuit = SharedVendorCircuit(settings.redis_url, "asr")
+    asr_circuit = SharedVendorCircuit(settings.redis_url, "asr")
+    tts_circuit = SharedVendorCircuit(settings.redis_url, "tts")
+    llm_circuit = SharedVendorCircuit(settings.redis_url, "llm")
     try:
-        outcome = await run_session(frames, company=tenant.name, purpose=campaign.name, script=script, circuit=circuit)
-        _store_circuit_alerts(session, campaign.tenant_id, circuit)
+        outcome = await run_session(
+            frames,
+            company=tenant.name,
+            purpose=campaign.name,
+            script=script,
+            circuit=asr_circuit,
+            tts_circuit=tts_circuit,
+            llm_circuit=llm_circuit,
+        )
+        _store_circuit_alerts(session, campaign.tenant_id, asr_circuit, "asr")
+        _store_circuit_alerts(session, campaign.tenant_id, tts_circuit, "tts")
+        _store_circuit_alerts(session, campaign.tenant_id, llm_circuit, "llm")
     finally:
-        circuit.close()
+        asr_circuit.close()
+        tts_circuit.close()
+        llm_circuit.close()
     if heard in _REJECTED_HEARD:
         status = "rejected"
     elif heard == "无人接听" or outcome.voicemail:
@@ -493,8 +509,12 @@ async def _place(
     )
     session.add(call)
     await session.flush()
+    if outcome.tts_down:
+        campaign.status = "paused"
     if status == "transferring":
         await _handoff(session, campaign, contact, task, call, now)
+    elif outcome.tts_down and not outcome.needs_dnd and not outcome.voicemail and heard not in _REJECTED_HEARD:
+        await _callback(session, campaign, contact, task, call, now, timedelta(minutes=30))
     elif status == "completed" and wants_reschedule(heard):
         await _callback(session, campaign, contact, task, call, now, timedelta(days=1))
     if caller is not None:

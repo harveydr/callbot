@@ -17,6 +17,22 @@
         :closable="false"
         style="margin-bottom: 12px"
       />
+      <el-alert
+        v-else-if="voiceMode === '语音合成暂停'"
+        title="语音合成不可用，新的外呼已暂停，系统会稍后回拨。"
+        type="error"
+        show-icon
+        :closable="false"
+        style="margin-bottom: 12px"
+      />
+      <el-alert
+        v-else-if="voiceMode === '话术树模式'"
+        title="话术树模式：我用标准流程为您解答。"
+        type="warning"
+        show-icon
+        :closable="false"
+        style="margin-bottom: 12px"
+      />
       <router-view />
     </el-main>
   </el-container>
@@ -31,6 +47,7 @@ import { useSession } from "./stores/session";
 const session = useSession();
 const router = useRouter();
 const degraded = ref(false);
+const voiceMode = ref("正常");
 session.hydrate();
 
 const links = computed(() => {
@@ -68,8 +85,10 @@ onMounted(async () => {
   try {
     const response = await api.get("/api/t/reports/overview");
     degraded.value = Boolean(response.data.data.degraded);
+    voiceMode.value = response.data.data.voice_mode || "正常";
   } catch {
     degraded.value = false;
+    voiceMode.value = "正常";
   }
 });
 

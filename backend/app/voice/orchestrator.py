@@ -18,6 +18,8 @@ from app.voice.vad import EnergyVad
 
 _INJECTION = ("忽略你的指令", "忽略之前的指令", "ignore previous instructions")
 _GRADE = {"agree": "B", "refuse": "D", "inquiry": "C", "invalid": "NA", "voicemail": "NA"}
+_SCRIPT_MODE = "我用标准流程为您解答。"
+_TTS_CALLBACK = "稍后为您回拨。"
 
 
 @dataclass(frozen=True)
@@ -42,6 +44,8 @@ class Outcome:
     redline_hits: list[str]
     needs_dnd: bool
     circuit_open: bool
+    tts_down: bool = False
+    llm_down: bool = False
     dropped_assistant_frames: int = 0
     channels: dict[str, str] = field(default_factory=dict)
 
@@ -65,6 +69,21 @@ def _reply(intent: str, opening: str) -> tuple[str, str]:
     return "speak", f"{opening}我记下了，让同事回电给您。"
 
 
+async def _speak(speaker: MockTts, circuit: CircuitPort, text: str) -> bool:
+    """Return True when synthesis was skipped or the vendor rejected it."""
+    if not text:
+        return False
+    if not circuit.allow_vendor():
+        return True
+    try:
+        await speaker.synthesize(text)
+    except VendorRejected as exc:
+        circuit.observe(exc.status)
+        return circuit.open
+    circuit.observe_success()
+    return False
+
+
 async def _asr_text(asr: MockAsr, circuit: CircuitPort, pcm: bytes) -> tuple[str, bool]:
     if not circuit.allow_vendor():
         return decode_pcm(pcm), True
@@ -86,6 +105,8 @@ async def run_session(
     tts: MockTts | None = None,
     llm_mode: str = "ok",
     circuit: CircuitPort | None = None,
+    tts_circuit: CircuitPort | None = None,
+    llm_circuit: CircuitPort | None = None,
     script: list[dict[str, object]] | None = None,
 ) -> Outcome:
     started = time.perf_counter()
@@ -93,19 +114,22 @@ async def run_session(
     speaker = tts or MockTts()
     vad = EnergyVad()
     circuit = circuit or VendorCircuit()
+    tts_circuit = tts_circuit or VendorCircuit()
+    llm_circuit = llm_circuit or VendorCircuit()
     playback = Playback()
     opening = render_opening(company=company, purpose=purpose)
     playback.speak(opening)
-    await speaker.synthesize(opening)
+    tts_down = await _speak(speaker, tts_circuit, opening)
     heard_parts: list[str] = []
-    degraded = False
+    degraded = tts_down
     for frame in frames:
         if frame.dropped:
             continue
         if frame.channel == "assistant":
             if playback.playing:
                 playback.speak(decode_pcm(frame.pcm) or "assistant-audio")
-                await speaker.synthesize(decode_pcm(frame.pcm))
+                if not tts_down:
+                    tts_down = await _speak(speaker, tts_circuit, decode_pcm(frame.pcm))
             else:
                 playback.drop_assistant()
             continue
@@ -117,22 +141,30 @@ async def run_session(
         if text:
             heard_parts.append(text)
     heard = strip_injection("".join(heard_parts))
-    if llm_mode == "bad_json":
-        raw = "NOT_JSON"
-        degraded = True
-    elif llm_mode == "hostile":
-        raw = json.dumps({"intent": "agree", "say": "我们保证收益", "skip_compliance": True}, ensure_ascii=False)
-    else:
-        raw = json.dumps({"intent": classify_intent(heard)}, ensure_ascii=False)
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        parsed = None
-        degraded = True
-    model_intent = parsed.get("intent") if isinstance(parsed, dict) else None
-    intent = model_intent if isinstance(model_intent, str) and llm_mode == "ok" else classify_intent(heard)
-    if llm_mode == "hostile":
+    if llm_mode == "down":
+        llm_circuit.observe(503)
+    llm_down = not llm_circuit.allow_vendor()
+    if llm_down:
         intent = classify_intent(heard)
+        degraded = True
+    else:
+        if llm_mode == "bad_json":
+            raw = "NOT_JSON"
+            degraded = True
+        elif llm_mode == "hostile":
+            raw = json.dumps({"intent": "agree", "say": "我们保证收益", "skip_compliance": True}, ensure_ascii=False)
+        else:
+            raw = json.dumps({"intent": classify_intent(heard)}, ensure_ascii=False)
+            llm_circuit.observe_success()
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = None
+            degraded = True
+        model_intent = parsed.get("intent") if isinstance(parsed, dict) else None
+        intent = model_intent if isinstance(model_intent, str) and llm_mode == "ok" else classify_intent(heard)
+        if llm_mode == "hostile":
+            intent = classify_intent(heard)
     script_body, script_action, mandatory = render_script(parse_nodes(script), intent=intent)
     if mandatory:
         action = script_action
@@ -143,7 +175,13 @@ async def run_session(
     for line in mandatory:
         if line not in guarded:
             guarded = f"{line}{guarded}"
-    if guard_action == "hangup":
+    if llm_down and _SCRIPT_MODE not in guarded:
+        guarded = f"{opening}{_SCRIPT_MODE}{guarded.removeprefix(opening)}"
+    if tts_down:
+        action = "hangup"
+        if _TTS_CALLBACK not in guarded:
+            guarded = f"{guarded}{_TTS_CALLBACK}"
+    elif guard_action == "hangup":
         action = "hangup"
     elapsed = (time.perf_counter() - started) * 1000
     channels = {turn["speaker"]: turn["channel"] for turn in playback.turns}
@@ -152,7 +190,7 @@ async def run_session(
         action=action,
         barged_in=playback.barged_in,
         voicemail=intent == "voicemail",
-        degraded=degraded or circuit.open,
+        degraded=degraded or circuit.open or tts_down or llm_down,
         latency_ms=elapsed,
         intent=intent,
         intent_grade=_GRADE.get(intent, "NA"),
@@ -161,6 +199,8 @@ async def run_session(
         redline_hits=hits,
         needs_dnd=intent == "refuse",
         circuit_open=circuit.open,
+        tts_down=tts_down,
+        llm_down=llm_down,
         dropped_assistant_frames=playback.dropped_assistant_frames,
         channels=channels,
     )

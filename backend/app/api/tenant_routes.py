@@ -37,6 +37,7 @@ from app.models.extra import BillingItem, Complaint, EvidencePack, ImportJob, Qc
 from app.security.crypto import PhoneInvalidError, encrypt_phone, encrypt_secret, normalize_phone, phone_hash
 from app.security.sip import assert_public_sip_host
 from app.services.exports import export_is_usable, export_payload, render_report
+from app.voice.circuit import shared_voice_mode
 from app.voice.stereo import recording_payload
 from app.services.control import (
     assert_caller,
@@ -60,6 +61,13 @@ from app.services.control import (
     utcnow,
 )
 from app.services.dialer import schedule_retries
+
+_VOICE_LABEL = {"normal": "正常", "script": "话术树模式", "paused_vendor": "语音合成暂停"}
+
+
+def _voice_mode(request: Request) -> str:
+    mode = shared_voice_mode(request.app.state.settings.redis_url)
+    return _VOICE_LABEL.get(mode, "正常")
 
 
 @tenant_router.post("/trunks")
@@ -434,7 +442,22 @@ async def list_campaigns(
             select(Campaign).where(Campaign.tenant_id == tenant_id).order_by(Campaign.created_at.desc()).limit(limit).offset(offset)
         )
     ).all()
-    return envelope(request.state.trace_id, {"items": [{"id": str(row.id), "name": row.name, "status": row.status, "version": row.version} for row in rows]})
+    voice_mode = _voice_mode(request)
+    return envelope(
+        request.state.trace_id,
+        {
+            "items": [
+                {
+                    "id": str(row.id),
+                    "name": row.name,
+                    "status": row.status,
+                    "version": row.version,
+                    "voice_mode": voice_mode,
+                }
+                for row in rows
+            ]
+        },
+    )
 
 
 @tenant_router.get("/campaigns/{campaign_id}")
@@ -862,6 +885,7 @@ async def overview_route(
 ) -> dict[str, object]:
     data = await overview(session, require_tenant(principal))
     data["degraded"] = not request.app.state.settings.calling_enabled
+    data["voice_mode"] = _voice_mode(request)
     return envelope(request.state.trace_id, data)
 
 

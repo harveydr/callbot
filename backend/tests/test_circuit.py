@@ -9,8 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import load_settings
 from app.db import set_bypass
-from app.models import Task
-from app.models.extra import Alert
+from app.models import Call, Task
+from app.models.extra import Alert, CallTurn
 from app.services.dialer import dial_pending
 from app.voice.circuit import SharedVendorCircuit, VendorCircuit, reset_vendor_circuits
 from tests.test_qc import NOW, _ready
@@ -143,3 +143,77 @@ async def test_dial_stores_the_circuit_alert(
         shared.reset()
         shared.close()
         reset_vendor_circuits()
+
+
+async def test_tts_outage_pauses_the_campaign_and_books_a_callback(
+    session_factory: async_sessionmaker[AsyncSession], redis_client
+) -> None:
+    settings = load_settings()
+    tts = SharedVendorCircuit(settings.redis_url, "tts")
+    tts.reset()
+    try:
+        tts.observe(429)
+        async with session_factory() as session:
+            await set_bypass(session)
+            tenant, trunk, campaign, contact = await _ready(session, "tts-down", "13800006671")
+            session.add(
+                Task(tenant_id=tenant.id, campaign_id=campaign.id, contact_id=contact.id, attempt_no=1, status="pending")
+            )
+            await session.flush()
+            started = await dial_pending(
+                session,
+                campaign=campaign,
+                tenant=tenant,
+                trunk=trunk,
+                settings=settings,
+                redis=redis_client,
+                now=NOW,
+                heard="好的",
+            )
+            spoken = await session.scalar(select(CallTurn.text_content).where(CallTurn.speaker == "assistant"))
+            follow = await session.scalar(select(Task).where(Task.attempt_no == 2))
+            alert = await session.scalar(select(Alert).where(Alert.tenant_id == tenant.id, Alert.code == "circuit_open"))
+            assert started == 1
+            assert campaign.status == "paused"
+            assert spoken is not None and "稍后为您回拨" in spoken and "人工智能" in spoken and "录音" in spoken
+            assert follow is not None and follow.status == "pending"
+            assert alert is not None and "tts" in alert.message
+    finally:
+        tts.reset()
+        tts.close()
+
+
+async def test_llm_outage_keeps_the_campaign_running(
+    session_factory: async_sessionmaker[AsyncSession], redis_client
+) -> None:
+    settings = load_settings()
+    llm = SharedVendorCircuit(settings.redis_url, "llm")
+    llm.reset()
+    try:
+        llm.observe(429)
+        async with session_factory() as session:
+            await set_bypass(session)
+            tenant, trunk, campaign, contact = await _ready(session, "llm-down", "13800006672")
+            session.add(
+                Task(tenant_id=tenant.id, campaign_id=campaign.id, contact_id=contact.id, attempt_no=1, status="pending")
+            )
+            await session.flush()
+            started = await dial_pending(
+                session,
+                campaign=campaign,
+                tenant=tenant,
+                trunk=trunk,
+                settings=settings,
+                redis=redis_client,
+                now=NOW,
+                heard="好的",
+            )
+            spoken = await session.scalar(select(CallTurn.text_content).where(CallTurn.speaker == "assistant"))
+            call = await session.scalar(select(Call).where(Call.campaign_id == campaign.id))
+            assert started == 1
+            assert campaign.status == "running"
+            assert call is not None and call.status == "completed"
+            assert spoken is not None and "我用标准流程为您解答" in spoken and "人工智能" in spoken
+    finally:
+        llm.reset()
+        llm.close()
