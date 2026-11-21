@@ -10,12 +10,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.compliance.gate_pre import CampaignView, Flags, TenantView, TrunkView, pre_dial_gate
+from app.compliance.guard_incall import on_caller_text
 from app.compliance.opening import opening_is_complete
 from app.config import Settings
 from app.models import Call, CallEvent, Campaign, Contact, Task, Tenant, Trunk
 from app.models.extra import BillingItem, BillingRate, CallTurn, QcResult, Recording, Transcript
 from app.services.tokens import TokenBucket
-from app.voice.mock_roundtrip import mock_roundtrip
+from app.voice.orchestrator import Frame, run_session
 
 EXPLICIT_AIGC = "以下为人工智能生成合成语音"
 _RETRYABLE = ("no_answer", "busy")
@@ -209,9 +210,14 @@ async def _place(
     now: datetime,
     heard: str,
 ) -> None:
-    spoken = heard if heard != "无人接听" else ""
-    turn = await mock_roundtrip(f"PCM:{spoken}".encode("utf-8"), company=tenant.name, purpose=campaign.name)
-    status = "no_answer" if heard == "无人接听" else "completed"
+    frames = [] if heard == "无人接听" else [Frame("caller", f"PCM:{heard}".encode("utf-8"))]
+    outcome = await run_session(frames, company=tenant.name, purpose=campaign.name)
+    if heard == "无人接听" or outcome.voicemail:
+        status = "no_answer"
+    elif outcome.action == "transfer":
+        status = "transferring"
+    else:
+        status = "completed"
     call_uuid = uuid.uuid4()
     call = Call(
         tenant_id=campaign.tenant_id,
@@ -226,12 +232,24 @@ async def _place(
         answer_at=now if status == "completed" else None,
         end_at=now,
         duration_sec=0 if status != "completed" else 30,
-        intent_grade="B" if turn.intent == "agree" else "NA",
-        compliance_hit=[{"rule": code} for code in turn.redline_hits],
+        intent_grade=outcome.intent_grade,
+        compliance_hit=[{"rule": code} for code in outcome.redline_hits],
         created_by=campaign.created_by,
     )
     session.add(call)
     await session.flush()
+    if outcome.needs_dnd:
+        await on_caller_text(
+            session,
+            tenant_id=campaign.tenant_id,
+            call_id=call.id,
+            phone_hash=contact.phone_hash,
+            phone_last4=contact.phone_last4,
+            text=heard,
+            company=tenant.name,
+            purpose=campaign.name,
+            opening_played=True,
+        )
     task.status = "done"
     session.add(
         CallTurn(
@@ -239,17 +257,17 @@ async def _place(
             call_id=call.id,
             turn_idx=0,
             speaker="assistant",
-            text_content=turn.reply_text,
+            text_content=outcome.reply_text,
         )
     )
-    if spoken:
+    if outcome.heard:
         session.add(
             CallTurn(
                 tenant_id=campaign.tenant_id,
                 call_id=call.id,
                 turn_idx=1,
                 speaker="caller",
-                text_content=spoken,
+                text_content=outcome.heard,
             )
         )
     producer = settings.aigc_producer_code or "UNREGISTERED"
@@ -271,7 +289,7 @@ async def _place(
         Transcript(
             tenant_id=campaign.tenant_id,
             call_id=call.id,
-            body={"explicit_label": EXPLICIT_AIGC, "turns": [{"speaker": "assistant", "text": turn.reply_text}]},
+            body={"explicit_label": EXPLICIT_AIGC, "turns": [{"speaker": "assistant", "text": outcome.reply_text}]},
             summary=None,
             created_by=campaign.created_by,
         )
@@ -280,8 +298,8 @@ async def _place(
         QcResult(
             tenant_id=campaign.tenant_id,
             call_id=call.id,
-            result="pass" if opening_is_complete(turn.reply_text) else "fail",
-            detail={"ai_notice_present": opening_is_complete(turn.reply_text), "summary": None},
+            result="pass" if opening_is_complete(outcome.reply_text) else "fail",
+            detail={"ai_notice_present": opening_is_complete(outcome.reply_text), "summary": None},
         )
     )
     session.add(

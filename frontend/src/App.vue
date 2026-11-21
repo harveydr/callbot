@@ -50,7 +50,11 @@ const links = computed(() => {
     { to: "/t/live", label: "实时" },
   ];
   if (session.role === "tenant_admin") {
-    items.push({ to: "/t/billing", label: "账单" }, { to: "/t/members", label: "成员" });
+    items.push(
+      { to: "/t/reports", label: "报表" },
+      { to: "/t/billing", label: "账单" },
+      { to: "/t/members", label: "成员" },
+    );
   }
   if (session.role === "auditor" || session.role === "tenant_admin") {
     items.push({ to: "/t/audit/complaints", label: "合规" });

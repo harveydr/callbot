@@ -1,6 +1,8 @@
 <template>
   <div>
     <h1>{{ title }}</h1>
+    <el-button v-if="canExport" type="primary" @click="exportReport">导出明细</el-button>
+    <el-alert v-if="exportNote" :title="exportNote" type="success" show-icon :closable="false" style="margin: 12px 0" />
     <StateView :status="status" :message="message" :stale="stale" @retry="load(0)">
       <el-table :data="items" style="width: 100%">
         <el-table-column v-for="column in columns" :key="column" :prop="column" :label="column" />
@@ -12,16 +14,31 @@
 <script setup>
 import { computed, ref, watch } from "vue";
 import { useRoute } from "vue-router";
+import { ElMessageBox } from "element-plus";
 import StateView from "../components/StateView.vue";
 import { api } from "../api/client";
+import { useSession } from "../stores/session";
 
 const route = useRoute();
+const session = useSession();
 const status = ref("loading");
 const message = ref("");
+const exportNote = ref("");
 const stale = ref("");
 const items = ref([]);
 const title = computed(() => route.meta.title || "列表");
+const canExport = computed(() => route.path === "/t/reports" && session.role === "tenant_admin");
 const columns = computed(() => Object.keys(items.value[0] || {}));
+
+async function exportReport() {
+  try {
+    await ElMessageBox.confirm("导出包含通话明细，链接 15 分钟内有效。确认导出？", "导出确认");
+  } catch {
+    return;
+  }
+  const response = await api.get("/api/t/reports/export");
+  exportNote.value = `已生成导出任务 ${response.data.data.task_id}，15 分钟内有效`;
+}
 
 async function load(attempt) {
   status.value = "loading";

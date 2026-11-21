@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import secrets
 import uuid
-from datetime import timedelta
 
 from fastapi import Depends, File, Header, Request, UploadFile
 from fastapi.responses import JSONResponse
@@ -36,6 +35,7 @@ from app.models import Call, CallEvent, CallerNumber, Campaign, ConsentRecord, C
 from app.models.extra import BillingItem, Complaint, EvidencePack, ImportJob, QcResult, ReportExport, ScriptNode, Transcript
 from app.security.crypto import PhoneInvalidError, encrypt_phone, encrypt_secret, normalize_phone, phone_hash
 from app.security.sip import assert_public_sip_host
+from app.services.exports import export_expires_at
 from app.services.control import (
     assert_caller,
     assert_freq,
@@ -833,7 +833,7 @@ async def export_route(
     session: AsyncSession = Depends(db_session),
 ) -> dict[str, object]:
     token = secrets.token_urlsafe(24)
-    row = ReportExport(tenant_id=require_tenant(principal), status="done", download_token=token, expires_at=utcnow() + timedelta(minutes=15))
+    row = ReportExport(tenant_id=require_tenant(principal), status="done", download_token=token, expires_at=export_expires_at(utcnow()))
     session.add(row)
     await session.flush()
     return envelope(request.state.trace_id, {"task_id": str(row.id), "status": row.status, "download_token": token})

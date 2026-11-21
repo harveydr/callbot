@@ -1,0 +1,37 @@
+groups:
+  - name: echodesk
+    rules:
+      - alert: ApiP95Slow
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 1
+        for: 5m
+        labels: {severity: warning}
+      - alert: CallAnswerRateLow
+        expr: call_answer_rate < 0.15
+        for: 30m
+        labels: {severity: warning}
+      - alert: ComplaintRateWarn
+        expr: complaint_rate_30d > 0.003
+        labels: {severity: warning}
+      - alert: ComplaintRateFuse
+        expr: complaint_rate_30d > 0.010
+        labels: {severity: critical}
+      - alert: AsrErrorRate
+        expr: asr_error_rate > 0.10
+        for: 2m
+        labels: {severity: warning}
+      - alert: LlmFirstTokenSlow
+        expr: histogram_quantile(0.95, rate(llm_first_token_seconds_bucket[10m])) > 1.5
+        for: 10m
+        labels: {severity: warning}
+      - alert: RecordingMissing
+        expr: recording_missing > 0
+        labels: {severity: critical}
+      - alert: DiskHigh
+        expr: disk_used_ratio > 0.80
+        labels: {severity: warning}
+      - alert: CertExpire
+        expr: cert_expire_days < 30
+        labels: {severity: warning}
+      - alert: OffWindowCall
+        expr: offwindow_call_count > 0
+        labels: {severity: critical}

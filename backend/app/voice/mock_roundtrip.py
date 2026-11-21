@@ -6,9 +6,7 @@ from dataclasses import dataclass
 
 from app.compliance.opening import render_opening
 from app.compliance.redline import scan_redline
-
-_REFUSE = ("不需要", "别再打", "不要")
-_AGREE = ("方便", "可以", "好的")
+from app.voice.intent import classify_intent
 
 
 @dataclass(frozen=True)
@@ -32,19 +30,9 @@ def _asr(pcm: bytes) -> str:
     return ""
 
 
-def _intent(text: str) -> str:
-    if not text:
-        return "invalid"
-    if any(word in text for word in _REFUSE):
-        return "refuse"
-    if any(word in text for word in _AGREE):
-        return "agree"
-    return "inquiry"
-
-
 async def mock_roundtrip(pcm: bytes, *, company: str = "示例公司", purpose: str = "预约提醒") -> MockTurn:
     heard = _asr(pcm)
-    intent = _intent(heard)
+    intent = classify_intent(heard)
     opening = render_opening(company=company, purpose=purpose)
     if intent == "invalid":
         reply = f"{opening}您好，我没有听清，方便的话请再说一次。"

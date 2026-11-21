@@ -48,6 +48,7 @@ jobs:
       - run: pytest -q
         working-directory: backend
       - run: python scripts/eval_redline.py
+      - run: python scripts/eval_intent.py
       - run: python scripts/go_live_check.py
 
   frontend:
