@@ -58,6 +58,7 @@ from app.security.jwt_codec import REFRESH_TTL, decode, issue
 from app.security.passwords import hash_password, verify_password
 from app.compliance.guardian import minor_marked
 from app.services.billing_budget import apply_billing_budget, month_spend
+from app.services.call_cost import quote_month
 from app.services.dialer import dial_pending, ensure_initial_tasks, schedule_retries
 
 _WINDOW = __import__("re").compile(r"^([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d$")
@@ -830,7 +831,9 @@ async def billing_summary(session: AsyncSession, tenant_id: uuid.UUID) -> dict[s
     quoted = [item.amount for item in items if item.amount is not None]
     amount = format(sum(quoted), "f") if quoted and len(quoted) == len(items) else None
     tenant = await session.scalar(select(Tenant).where(Tenant.id == tenant_id))
-    spend = await month_spend(session, tenant, utcnow()) if tenant is not None else None
+    moment = utcnow()
+    spend = await month_spend(session, tenant, moment) if tenant is not None else None
+    cost = await quote_month(session, tenant, moment) if tenant is not None else {"cost_per_call": None, "cost_per_intent": None, "cost_status": "unquoted"}
     return {
         "item_count": len(items),
         "amount": amount,
@@ -842,6 +845,9 @@ async def billing_summary(session: AsyncSession, tenant_id: uuid.UUID) -> dict[s
         "month_quoted": None if spend is None else format(spend.quoted, "f"),
         "month_unquoted": 0 if spend is None else spend.unquoted,
         "new_tasks_paused": False if spend is None else spend.reached,
+        "cost_per_call": cost["cost_per_call"],
+        "cost_per_intent": cost["cost_per_intent"],
+        "cost_status": cost["cost_status"],
     }
 
 

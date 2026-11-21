@@ -66,6 +66,15 @@ const labels = {
   month_quoted: "本月已报价",
   month_unquoted: "本月未报价笔数",
   new_tasks_paused: "新任务已暂停",
+  cost_per_call: "每通成本",
+  cost_per_intent: "每意向成本",
+  cost_status: "成本状态",
+};
+const costStatus = {
+  unquoted: "未报价",
+  usage_unmetered: "用量未计量",
+  no_calls: "本月无接通",
+  quoted: "已核算",
 };
 
 function labelOf(column) {
@@ -74,6 +83,7 @@ function labelOf(column) {
 
 function formatCell(column, value) {
   if (value === null || value === undefined || value === "") return "—";
+  if (column === "cost_status") return costStatus[value] || value;
   if (column.endsWith("_rate")) return `${(Number(value) * 100).toFixed(1)}%`;
   if (typeof value === "boolean") return value ? "是" : "否";
   return value;
