@@ -12,7 +12,7 @@ from app.db import set_bypass
 from app.models import Task
 from app.models.extra import Alert
 from app.services.dialer import dial_pending
-from app.voice.circuit import VendorCircuit, reset_vendor_circuits, vendor_circuit
+from app.voice.circuit import SharedVendorCircuit, VendorCircuit, reset_vendor_circuits
 from tests.test_qc import NOW, _ready
 
 
@@ -90,13 +90,35 @@ def test_a_failed_probe_opens_the_circuit_again() -> None:
     assert circuit.allow_vendor() is True
 
 
+def test_two_processes_share_one_open_circuit() -> None:
+    settings = load_settings()
+    ticks = [1_000.0]
+    first = SharedVendorCircuit(settings.redis_url, "asr-share", clock=lambda: ticks[0])
+    second = SharedVendorCircuit(settings.redis_url, "asr-share", clock=lambda: ticks[0])
+    try:
+        first.reset()
+        first.observe(429)
+        assert second.open is True
+        assert second.allow_vendor() is False
+        ticks[0] = 1_030.0
+        assert first.allow_vendor() is True
+        assert second.allow_vendor() is False
+        assert [code for code, _reason in first.drain_alerts()] == ["circuit_open", "circuit_half_open"]
+    finally:
+        first.reset()
+        first.close()
+        second.close()
+
+
 async def test_dial_stores_the_circuit_alert(
     session_factory: async_sessionmaker[AsyncSession], redis_client
 ) -> None:
+    settings = load_settings()
+    shared = SharedVendorCircuit(settings.redis_url, "asr")
+    shared.reset()
     reset_vendor_circuits()
     try:
-        vendor_circuit("asr").observe(429)
-        settings = load_settings()
+        shared.observe(429)
         async with session_factory() as session:
             await set_bypass(session)
             tenant, trunk, campaign, contact = await _ready(session, "circuit-co", "13800006661")
@@ -118,4 +140,6 @@ async def test_dial_stores_the_circuit_alert(
             assert started == 1
             assert alert is not None and alert.severity == "warning" and "vendor_429" in alert.message
     finally:
+        shared.reset()
+        shared.close()
         reset_vendor_circuits()

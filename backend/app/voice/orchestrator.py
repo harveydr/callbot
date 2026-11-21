@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from app.compliance.opening import render_opening
 from app.compliance.redline import guard_assistant_text
 from app.voice.asr import MockAsr, VendorRejected, decode_pcm
-from app.voice.circuit import VendorCircuit
+from app.voice.circuit import CircuitPort, VendorCircuit
 from app.voice.intent import classify_intent
 from app.voice.script import parse_nodes, render_script
 from app.voice.session import Playback
@@ -65,7 +65,7 @@ def _reply(intent: str, opening: str) -> tuple[str, str]:
     return "speak", f"{opening}我记下了，让同事回电给您。"
 
 
-async def _asr_text(asr: MockAsr, circuit: VendorCircuit, pcm: bytes) -> tuple[str, bool]:
+async def _asr_text(asr: MockAsr, circuit: CircuitPort, pcm: bytes) -> tuple[str, bool]:
     if not circuit.allow_vendor():
         return decode_pcm(pcm), True
     try:
@@ -85,7 +85,7 @@ async def run_session(
     asr: MockAsr | None = None,
     tts: MockTts | None = None,
     llm_mode: str = "ok",
-    circuit: VendorCircuit | None = None,
+    circuit: CircuitPort | None = None,
     script: list[dict[str, object]] | None = None,
 ) -> Outcome:
     started = time.perf_counter()

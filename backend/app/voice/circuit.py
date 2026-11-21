@@ -7,9 +7,13 @@ request after 30 seconds.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Callable
+from typing import Protocol, TypeVar
+
+import redis
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +22,7 @@ _WINDOW_SECONDS = 30.0
 _MIN_SAMPLE = 5
 _CONSECUTIVE = 5
 _REGISTRY: dict[str, "VendorCircuit"] = {}
+_T = TypeVar("_T")
 
 
 class VendorCircuit:
@@ -110,6 +115,40 @@ class VendorCircuit:
         logger.warning("vendor circuit %s %s", code, reason)
         self._alerts.append((code, reason))
 
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "state": self._state,
+            "reason": self._reason,
+            "opened_at": self._opened_at,
+            "consecutive": self._consecutive,
+            "probe_used": self._probe_used,
+            "samples": [[stamp, failed] for stamp, failed in self._samples],
+            "alerts": [[code, reason] for code, reason in self._alerts],
+        }
+
+    def restore(self, payload: dict[str, object]) -> None:
+        self._state = str(payload.get("state") or "closed")
+        self._reason = str(payload.get("reason") or "")
+        opened = payload.get("opened_at")
+        self._opened_at = float(opened) if isinstance(opened, (int, float)) else 0.0
+        consecutive = payload.get("consecutive")
+        self._consecutive = consecutive if isinstance(consecutive, int) and not isinstance(consecutive, bool) else 0
+        self._probe_used = bool(payload.get("probe_used"))
+        samples = payload.get("samples")
+        restored: list[tuple[float, bool]] = []
+        if isinstance(samples, list):
+            for item in samples:
+                if isinstance(item, list) and len(item) == 2 and isinstance(item[0], (int, float)):
+                    restored.append((float(item[0]), bool(item[1])))
+        self._samples = restored
+        alerts = payload.get("alerts")
+        pending: list[tuple[str, str]] = []
+        if isinstance(alerts, list):
+            for item in alerts:
+                if isinstance(item, list) and len(item) == 2:
+                    pending.append((str(item[0]), str(item[1])))
+        self._alerts = pending
+
 
 def vendor_circuit(name: str) -> VendorCircuit:
     circuit = _REGISTRY.get(name)
@@ -121,3 +160,94 @@ def vendor_circuit(name: str) -> VendorCircuit:
 
 def reset_vendor_circuits() -> None:
     _REGISTRY.clear()
+
+
+class CircuitPort(Protocol):
+    @property
+    def open(self) -> bool: ...
+
+    def allow_vendor(self) -> bool: ...
+
+    def observe(self, status: int) -> None: ...
+
+    def observe_success(self) -> None: ...
+
+    def drain_alerts(self) -> list[tuple[str, str]]: ...
+
+
+class SharedVendorCircuit:
+    """The same ASR breaker for every worker. The clock is wall time so processes agree."""
+
+    def __init__(self, redis_url: str, name: str, *, clock: Callable[[], float] | None = None) -> None:
+        self._clock = clock or time.time
+        self._name = name
+        self._data = f"vendor_circuit:{name}"
+        self._lock = f"vendor_circuit:{name}:lock"
+        self._client = redis.Redis.from_url(redis_url, decode_responses=True)
+
+    def close(self) -> None:
+        self._client.close()  # type: ignore[no-untyped-call]
+
+    def reset(self) -> None:
+        self._client.delete(self._data, self._lock)
+
+    @property
+    def open(self) -> bool:
+        raw = self._client.get(self._data)
+        if not isinstance(raw, str) or not raw:
+            return False
+        circuit = VendorCircuit(clock=self._clock)
+        circuit.restore(_payload(raw))
+        return circuit.open
+
+    def allow_vendor(self) -> bool:
+        def mutate(circuit: VendorCircuit) -> bool:
+            return circuit.allow_vendor()
+
+        return self._with_state(mutate)
+
+    def observe(self, status: int) -> None:
+        def mutate(circuit: VendorCircuit) -> None:
+            circuit.observe(status)
+
+        self._with_state(mutate)
+
+    def observe_success(self) -> None:
+        def mutate(circuit: VendorCircuit) -> None:
+            circuit.observe_success()
+
+        self._with_state(mutate)
+
+    def drain_alerts(self) -> list[tuple[str, str]]:
+        def mutate(circuit: VendorCircuit) -> list[tuple[str, str]]:
+            return circuit.drain_alerts()
+
+        return self._with_state(mutate)
+
+    def _with_state(self, mutate: Callable[[VendorCircuit], _T]) -> _T:
+        acquired = False
+        for _ in range(20):
+            if self._client.set(self._lock, "1", nx=True, ex=2):
+                acquired = True
+                break
+            time.sleep(0.01)
+        if not acquired:
+            logger.warning("vendor circuit lock busy %s", self._name)
+            return mutate(VendorCircuit(clock=self._clock))
+        try:
+            circuit = VendorCircuit(clock=self._clock)
+            raw = self._client.get(self._data)
+            if isinstance(raw, str) and raw:
+                circuit.restore(_payload(raw))
+            result = mutate(circuit)
+            self._client.set(self._data, json.dumps(circuit.snapshot()))
+            return result
+        finally:
+            self._client.delete(self._lock)
+
+
+def _payload(raw: str) -> dict[str, object]:
+    loaded = json.loads(raw)
+    if not isinstance(loaded, dict):
+        return {}
+    return {str(key): value for key, value in loaded.items()}

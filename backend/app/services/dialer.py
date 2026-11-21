@@ -31,7 +31,7 @@ from app.models.extra import (
     Transcript,
 )
 from app.services.tokens import TokenBucket
-from app.voice.circuit import VendorCircuit, vendor_circuit
+from app.voice.circuit import CircuitPort, SharedVendorCircuit
 from app.voice.orchestrator import Frame, run_session
 from app.voice.stereo import EXPLICIT_LABEL, label_meta, write_recording
 
@@ -58,7 +58,7 @@ _REJECT_SAMPLE = 5
 _REJECT_RATE = 0.85
 
 
-def _store_circuit_alerts(session: AsyncSession, tenant_id: uuid.UUID, circuit: VendorCircuit) -> None:
+def _store_circuit_alerts(session: AsyncSession, tenant_id: uuid.UUID, circuit: CircuitPort) -> None:
     for code, reason in circuit.drain_alerts():
         session.add(
             Alert(
@@ -452,9 +452,12 @@ async def _place(
     script: list[dict[str, object]] = []
     for row in script_rows:
         script.append({"node_key": row.node_key, "node_type": row.node_type, "content": row.content})
-    circuit = vendor_circuit("asr")
-    outcome = await run_session(frames, company=tenant.name, purpose=campaign.name, script=script, circuit=circuit)
-    _store_circuit_alerts(session, campaign.tenant_id, circuit)
+    circuit = SharedVendorCircuit(settings.redis_url, "asr")
+    try:
+        outcome = await run_session(frames, company=tenant.name, purpose=campaign.name, script=script, circuit=circuit)
+        _store_circuit_alerts(session, campaign.tenant_id, circuit)
+    finally:
+        circuit.close()
     if heard in _REJECTED_HEARD:
         status = "rejected"
     elif heard == "无人接听" or outcome.voicemail:
