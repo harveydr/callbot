@@ -324,6 +324,10 @@ async def import_contacts(
     platform_rows = (await session.scalars(select(PlatformDnd.phone_hash))).all()
     consented = set(consent_rows)
     blocked = set(dnd_rows) | set(platform_rows)
+    known = {
+        row.phone_hash: row
+        for row in (await session.scalars(select(Contact).where(Contact.list_id == contact_list.id))).all()
+    }
     job = ImportJob(tenant_id=tenant_id, list_id=contact_list.id, file_md5=digest, status="running", errors=[])
     session.add(job)
     await session.flush()
@@ -349,26 +353,25 @@ async def import_contacts(
         else:
             dial_class = "dialable"
         counts[dial_class] += 1
-        existing = await session.scalar(
-            select(Contact).where(Contact.list_id == contact_list.id, Contact.phone_hash == digest_phone)
-        )
+        existing = known.get(digest_phone)
         if existing is None:
-            session.add(
-                Contact(
-                    tenant_id=tenant_id,
-                    list_id=contact_list.id,
-                    phone_enc=encrypt_phone(normalized, settings.field_enc_key),
-                    phone_last4=normalized[-4:],
-                    phone_hash=digest_phone,
-                    display_name=(row.get("name") or "").strip() or None,
-                    dial_class=dial_class,
-                    reason=None if dial_class == "dialable" else dial_class,
-                )
+            existing = Contact(
+                tenant_id=tenant_id,
+                list_id=contact_list.id,
+                phone_enc=encrypt_phone(normalized, settings.field_enc_key),
+                phone_last4=normalized[-4:],
+                phone_hash=digest_phone,
+                display_name=(row.get("name") or "").strip() or None,
+                dial_class=dial_class,
+                reason=None if dial_class == "dialable" else dial_class,
             )
+            session.add(existing)
+            known[digest_phone] = existing
         else:
             existing.dial_class = dial_class
             existing.deleted_at = None
-        if counts["total"] % 1000 == 0:
+            existing.reason = None if dial_class == "dialable" else dial_class
+        if counts["total"] % 5000 == 0:
             await session.flush()
     await session.flush()
     job.status = "done"
