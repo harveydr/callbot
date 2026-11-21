@@ -146,6 +146,52 @@ async def test_replay_p50_stays_under_the_voice_budget() -> None:
     assert samples[len(samples) // 2] <= 1200
 
 
+async def test_mandatory_script_lines_survive_a_hostile_model() -> None:
+    script = [
+        {
+            "node_key": "n_open",
+            "node_type": "mandatory",
+            "content": {"text": "必须播报的开场要点。", "next": "n_gate"},
+        },
+        {
+            "node_key": "n_gate",
+            "node_type": "gate",
+            "content": {"routes": {"agree": "n_close", "refuse": "n_bye"}},
+        },
+        {
+            "node_key": "n_close",
+            "node_type": "mandatory",
+            "content": {"text": "感谢确认。"},
+        },
+        {
+            "node_key": "n_bye",
+            "node_type": "mandatory",
+            "content": {"text": "不再打扰。"},
+        },
+    ]
+    agreed = await run_session(
+        [Frame("caller", "PCM:好的".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        llm_mode="hostile",
+        script=script,
+    )
+    refused = await run_session(
+        [Frame("caller", "PCM:别再打".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        script=script,
+    )
+    assert "必须播报的开场要点。" in agreed.reply_text
+    assert "感谢确认。" in agreed.reply_text
+    assert "不再打扰。" not in agreed.reply_text
+    assert "保证收益" not in agreed.reply_text
+    assert opening_is_complete(agreed.reply_text)
+    assert "不再打扰。" in refused.reply_text
+    assert "感谢确认。" not in refused.reply_text
+    assert refused.needs_dnd is True
+
+
 async def test_stop_request_during_dial_writes_dnd(
     session_factory: async_sessionmaker[AsyncSession], redis_client
 ) -> None:

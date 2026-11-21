@@ -8,6 +8,7 @@ import io
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import TypeVar
 
 import redis.asyncio as redis_async
@@ -20,6 +21,7 @@ from app.errors import ApiError
 from app.models import (
     AuditLog,
     Call,
+    CallerNumber,
     Campaign,
     ConsentRecord,
     Contact,
@@ -437,6 +439,38 @@ async def start_campaign(
     return {"campaign_id": str(campaign.id), "task_count": total, "idempotent": False, "started": started}
 
 
+async def _block_caller_if_complaint_rate(
+    session: AsyncSession, *, tenant_id: uuid.UUID, call_id: uuid.UUID | None
+) -> None:
+    if call_id is None:
+        return
+    call = await session.get(Call, call_id)
+    if call is None or call.tenant_id != tenant_id or not call.caller_number:
+        return
+    number = await session.scalar(
+        select(CallerNumber).where(CallerNumber.tenant_id == tenant_id, CallerNumber.number == call.caller_number)
+    )
+    if number is None:
+        return
+    number.complaint_count_30d += 1
+    since = datetime.now(timezone.utc) - timedelta(days=30)
+    dialed = int(
+        await session.scalar(
+            select(func.count())
+            .select_from(Call)
+            .where(
+                Call.tenant_id == tenant_id,
+                Call.caller_number == number.number,
+                Call.start_at.is_not(None),
+                Call.start_at >= since,
+            )
+        )
+        or 0
+    )
+    if dialed > 0 and Decimal(number.complaint_count_30d) / Decimal(dialed) >= Decimal("0.0100"):
+        number.status = "blocked"
+
+
 async def open_complaint(
     session: AsyncSession,
     *,
@@ -474,6 +508,7 @@ async def open_complaint(
                 permanent=True,
             )
         )
+    await _block_caller_if_complaint_rate(session, tenant_id=tenant_id, call_id=call_id)
     await session.flush()
     await audit(session, tenant_id=tenant_id, user_id=user_id, action="complaint.create", target_type="complaint", target_id=str(complaint.id), detail={"phone": mask_phone(normalized)}, trace_id=trace_id)
     return {"id": str(complaint.id), "phone_last4": complaint.phone_last4, "status": complaint.status, "dnd": True}

@@ -11,6 +11,7 @@ from app.compliance.redline import guard_assistant_text
 from app.voice.asr import MockAsr, VendorRejected, decode_pcm
 from app.voice.circuit import VendorCircuit
 from app.voice.intent import classify_intent
+from app.voice.script import parse_nodes, render_script
 from app.voice.session import Playback
 from app.voice.tts import MockTts
 from app.voice.vad import EnergyVad
@@ -83,6 +84,7 @@ async def run_session(
     tts: MockTts | None = None,
     llm_mode: str = "ok",
     circuit: VendorCircuit | None = None,
+    script: list[dict[str, object]] | None = None,
 ) -> Outcome:
     started = time.perf_counter()
     recognizer = asr or MockAsr()
@@ -129,8 +131,16 @@ async def run_session(
     intent = model_intent if isinstance(model_intent, str) and llm_mode == "ok" else classify_intent(heard)
     if llm_mode == "hostile":
         intent = classify_intent(heard)
-    action, reply = _reply(intent, opening)
+    script_body, script_action, mandatory = render_script(parse_nodes(script), intent=intent)
+    if mandatory:
+        action = script_action
+        reply = opening + script_body
+    else:
+        action, reply = _reply(intent, opening)
     guarded, hits, guard_action = guard_assistant_text(reply, prior_hits=0)
+    for line in mandatory:
+        if line not in guarded:
+            guarded = f"{line}{guarded}"
     if guard_action == "hangup":
         action = "hangup"
     elapsed = (time.perf_counter() - started) * 1000

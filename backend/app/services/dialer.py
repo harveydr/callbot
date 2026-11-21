@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from typing import cast
+from zoneinfo import ZoneInfo
 
 import redis.asyncio as redis_async
 from sqlalchemy import select
@@ -13,13 +16,26 @@ from app.compliance.gate_pre import CampaignView, Flags, TenantView, TrunkView, 
 from app.compliance.guard_incall import on_caller_text
 from app.compliance.opening import opening_is_complete
 from app.config import Settings
-from app.models import Call, CallEvent, Campaign, Contact, Task, Tenant, Trunk
-from app.models.extra import BillingItem, BillingRate, CallTurn, QcResult, Recording, Transcript
+from app.models import Call, CallEvent, CallerNumber, Campaign, Contact, Task, Tenant, Trunk, User
+from app.models.extra import (
+    BillingItem,
+    BillingRate,
+    CallTransfer,
+    CallTurn,
+    NumberHealthStat,
+    QcResult,
+    Recording,
+    ScriptNode,
+    Transcript,
+)
 from app.services.tokens import TokenBucket
 from app.voice.orchestrator import Frame, run_session
 
 EXPLICIT_AIGC = "以下为人工智能生成合成语音"
 _RETRYABLE = ("no_answer", "busy")
+_REJECTED_HEARD = frozenset({"拒接", "用户拒接"})
+_REJECT_SAMPLE = 5
+_REJECT_RATE = 0.85
 
 
 def _aware(now: datetime) -> datetime:
@@ -117,17 +133,22 @@ async def dial_pending(
         if not decision.allowed:
             await _blocked(session, campaign, contact, task, decision.code or "", decision.block_reason or "", moment)
             continue
+        caller = await _active_caller(session, campaign)
+        if campaign.caller_number_id is not None and caller is None:
+            await _blocked(session, campaign, contact, task, "COMPLIANCE_SCENARIO_NOT_ALLOWED", "caller_blocked", moment)
+            continue
         held = await bucket.acquire(f"live:{tenant.id}", limit=campaign.max_concurrency, ttl_sec=120)
         if not held:
             break
         try:
-            await _place(session, campaign, tenant, contact, task, settings, moment, heard)
+            await _place(session, campaign, tenant, contact, task, settings, moment, heard, caller)
         except Exception:
             task.status = "failed"
             raise
         started += 1
     for _ in range(started):
         await bucket.release(f"live:{tenant.id}")
+    await _pause_if_rejected(session, campaign, moment)
     return started
 
 
@@ -161,6 +182,71 @@ async def schedule_retries(session: AsyncSession, campaign: Campaign, now: datet
         created += 1
     await session.flush()
     return created
+
+
+async def _handoff(
+    session: AsyncSession,
+    campaign: Campaign,
+    contact: Contact,
+    task: Task,
+    call: Call,
+    now: datetime,
+) -> None:
+    agent = await session.scalar(
+        select(User)
+        .where(User.tenant_id == campaign.tenant_id, User.role == "agent", User.status == "active")
+        .limit(1)
+    )
+    if agent is not None:
+        session.add(CallTransfer(tenant_id=campaign.tenant_id, call_id=call.id, agent_id=agent.id, status="pending"))
+        return
+    call.status = "transfer_failed"
+    session.add(
+        CallEvent(
+            tenant_id=campaign.tenant_id,
+            call_id=call.id,
+            event_type="transfer",
+            detail={"status": "failed", "no_agent_action": "callback_30min"},
+        )
+    )
+    attempt_no = task.attempt_no + 1
+    exists = await session.scalar(
+        select(Task.id).where(
+            Task.campaign_id == campaign.id, Task.contact_id == contact.id, Task.attempt_no == attempt_no
+        )
+    )
+    if exists is None:
+        session.add(
+            Task(
+                tenant_id=campaign.tenant_id,
+                campaign_id=campaign.id,
+                contact_id=contact.id,
+                attempt_no=attempt_no,
+                status="pending",
+                next_run_at=now + timedelta(minutes=30),
+            )
+        )
+
+
+async def _touch_health(session: AsyncSession, caller: CallerNumber, *, answered: bool, now: datetime) -> None:
+    day = now.astimezone(ZoneInfo("Asia/Shanghai")).date()
+    stat = await session.scalar(
+        select(NumberHealthStat).where(NumberHealthStat.caller_number_id == caller.id, NumberHealthStat.stat_day == day)
+    )
+    rate = Decimal("1.0000") if answered else Decimal("0.0000")
+    if stat is None:
+        session.add(
+            NumberHealthStat(
+                tenant_id=caller.tenant_id,
+                caller_number_id=caller.id,
+                stat_day=day,
+                answer_rate=rate,
+                complaint_count=caller.complaint_count_30d,
+            )
+        )
+        return
+    stat.answer_rate = rate
+    stat.complaint_count = caller.complaint_count_30d
 
 
 async def _blocked(
@@ -200,6 +286,38 @@ async def _blocked(
     )
 
 
+async def _active_caller(session: AsyncSession, campaign: Campaign) -> CallerNumber | None:
+    if campaign.caller_number_id is not None:
+        row = cast(CallerNumber | None, await session.get(CallerNumber, campaign.caller_number_id))
+        if row is None or row.tenant_id != campaign.tenant_id or row.status != "active":
+            return None
+        return row
+    found: CallerNumber | None = await session.scalar(
+        select(CallerNumber)
+        .where(
+            CallerNumber.tenant_id == campaign.tenant_id,
+            CallerNumber.trunk_id == campaign.trunk_id,
+            CallerNumber.status == "active",
+        )
+        .limit(1)
+    )
+    return found
+
+
+async def _pause_if_rejected(session: AsyncSession, campaign: Campaign, now: datetime) -> None:
+    since = now - timedelta(minutes=5)
+    statuses = (
+        await session.scalars(
+            select(Call.status).where(Call.campaign_id == campaign.id, Call.start_at.is_not(None), Call.start_at >= since)
+        )
+    ).all()
+    if len(statuses) < _REJECT_SAMPLE:
+        return
+    rejected = sum(1 for status in statuses if status == "rejected")
+    if rejected / len(statuses) > _REJECT_RATE:
+        campaign.status = "paused"
+
+
 async def _place(
     session: AsyncSession,
     campaign: Campaign,
@@ -209,10 +327,19 @@ async def _place(
     settings: Settings,
     now: datetime,
     heard: str,
+    caller: CallerNumber | None,
 ) -> None:
     frames = [] if heard == "无人接听" else [Frame("caller", f"PCM:{heard}".encode("utf-8"))]
-    outcome = await run_session(frames, company=tenant.name, purpose=campaign.name)
-    if heard == "无人接听" or outcome.voicemail:
+    script_rows = (
+        await session.scalars(select(ScriptNode).where(ScriptNode.template_id == campaign.template_id).order_by(ScriptNode.node_key))
+    ).all()
+    script: list[dict[str, object]] = []
+    for row in script_rows:
+        script.append({"node_key": row.node_key, "node_type": row.node_type, "content": row.content})
+    outcome = await run_session(frames, company=tenant.name, purpose=campaign.name, script=script)
+    if heard in _REJECTED_HEARD:
+        status = "rejected"
+    elif heard == "无人接听" or outcome.voicemail:
         status = "no_answer"
     elif outcome.action == "transfer":
         status = "transferring"
@@ -225,7 +352,7 @@ async def _place(
         contact_id=contact.id,
         call_uuid=call_uuid,
         status=status,
-        caller_number=None,
+        caller_number=None if caller is None else caller.number,
         trunk_id=campaign.trunk_id,
         template_version=campaign.template_version,
         start_at=now,
@@ -238,6 +365,10 @@ async def _place(
     )
     session.add(call)
     await session.flush()
+    if status == "transferring":
+        await _handoff(session, campaign, contact, task, call, now)
+    if caller is not None:
+        await _touch_health(session, caller, answered=status == "completed", now=now)
     if outcome.needs_dnd:
         await on_caller_text(
             session,

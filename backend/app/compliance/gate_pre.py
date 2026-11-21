@@ -173,10 +173,24 @@ async def pre_dial_gate(
     if window_reason is not None:
         return block("COMPLIANCE_WINDOW_CLOSED", window_reason)
 
+    daily_since = local_period_start(now, timezone_name=tz_name, days=1)
+    rejected_today = await session.scalar(
+        select(Call.id)
+        .join(Contact, Call.contact_id == Contact.id)
+        .where(
+            Call.tenant_id == tenant.id,
+            Contact.phone_hash == phone_hash,
+            Call.status == "rejected",
+            Call.start_at >= daily_since,
+        )
+        .limit(1)
+    )
+    if rejected_today is not None:
+        return block("COMPLIANCE_WINDOW_CLOSED", "rejected_same_day")
+
     daily_limit = effective_freq_daily(campaign.freq_per_phone_daily)
     week_limit = effective_freq_7d(campaign.freq_per_phone_7d)
     month_limit = effective_freq_30d(campaign.freq_per_phone_30d)
-    daily_since = local_period_start(now, timezone_name=tz_name, days=1)
     week_since = local_period_start(now, timezone_name=tz_name, days=7)
     month_since = local_period_start(now, timezone_name=tz_name, days=30)
     if await _count_since(session, tenant_id=tenant.id, phone_hash=phone_hash, since=daily_since) >= daily_limit:
