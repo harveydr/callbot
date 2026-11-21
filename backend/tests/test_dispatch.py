@@ -136,8 +136,12 @@ async def test_script_and_caller_are_used(session_factory: async_sessionmaker[As
         callback = await session.scalar(select(Task).where(Task.attempt_no == 2))
         health = await session.scalar(select(NumberHealthStat).where(NumberHealthStat.caller_number_id == caller.id))
         assert started == 1
-        assert call is not None and call.caller_number == "02180001111" and call.status == "transfer_failed"
+        assert call is not None and call.caller_number == "02180001111" and call.status == "completed"
+        assert call.duration_sec == 30 and call.ai_duration_sec == 30 and call.answer_at == NOW
+        transfer = await session.scalar(select(CallEvent).where(CallEvent.call_id == call.id, CallEvent.event_type == "transfer"))
+        assert transfer is not None and transfer.detail["returned_to"] == "talking"
         assert spoken is not None and "必须播报的开场要点。" in spoken and "为您转接人工。" in spoken
+        assert "三十分钟内回拨" in spoken
         assert callback is not None and callback.next_run_at == NOW + timedelta(minutes=30)
         assert health is not None and health.answer_rate == Decimal("1.0000")
 
@@ -407,7 +411,7 @@ async def test_one_complaint_blocks_a_caller_at_the_stop_rate(
         await dial_pending(
             session, campaign=campaign, tenant=tenant, trunk=trunk, settings=settings, redis=redis_client, now=NOW, heard="好的"
         )
-        call = await session.scalar(select(Call).where(Call.campaign_id == campaign.id, Call.status == "transfer_failed"))
+        call = await session.scalar(select(Call).where(Call.campaign_id == campaign.id, Call.status == "completed"))
         assert call is not None
         await open_complaint(
             session,

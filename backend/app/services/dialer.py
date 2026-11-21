@@ -42,6 +42,7 @@ EXPLICIT_AIGC = EXPLICIT_LABEL
 _RETRYABLE = ("no_answer", "busy")
 _REJECTED_HEARD = frozenset({"拒接", "用户拒接"})
 _TOKEN_TTL_SEC = 7200
+_NO_AGENT_LINE = "现在没有同事在线，我为您登记三十分钟内回拨。"
 
 
 def concurrency_layers(tenant: Tenant, trunk: Trunk, campaign: Campaign) -> list[tuple[str, int]]:
@@ -339,7 +340,8 @@ async def _handoff(
     task: Task,
     call: Call,
     now: datetime,
-) -> None:
+) -> str | None:
+    """Park a waiting agent, or return to the call, promise a callback, and finish."""
     agent = await session.scalar(
         select(User)
         .where(User.tenant_id == campaign.tenant_id, User.role == "agent", User.status == "active")
@@ -347,17 +349,25 @@ async def _handoff(
     )
     if agent is not None:
         session.add(CallTransfer(tenant_id=campaign.tenant_id, call_id=call.id, agent_id=agent.id, status="pending"))
-        return
+        return None
     move_call(call, "transfer_failed")
     session.add(
         CallEvent(
             tenant_id=campaign.tenant_id,
             call_id=call.id,
             event_type="transfer",
-            detail={"status": "failed", "no_agent_action": "callback_30min"},
+            detail={"status": "failed", "no_agent_action": "callback_30min", "returned_to": "talking"},
         )
     )
     await _callback(session, campaign, contact, task, call, now, timedelta(minutes=30))
+    move_call(call, "talking")
+    if call.answer_at is None:
+        call.answer_at = now
+    call.duration_sec = 30
+    call.ai_duration_sec = 30
+    call.human_duration_sec = 0
+    move_call(call, "completed")
+    return _NO_AGENT_LINE
 
 
 async def _callback(
@@ -557,12 +567,15 @@ async def _place(
     await session.flush()
     if outcome.tts_down:
         campaign.status = "paused"
+    notice: str | None = None
     if status == "transferring":
-        await _handoff(session, campaign, contact, task, call, now)
+        notice = await _handoff(session, campaign, contact, task, call, now)
     elif outcome.tts_down and not outcome.needs_dnd and not outcome.voicemail and heard not in _REJECTED_HEARD:
         await _callback(session, campaign, contact, task, call, now, timedelta(minutes=30))
     elif status == "completed" and wants_reschedule(heard):
         await _callback(session, campaign, contact, task, call, now, timedelta(days=1))
+    if notice:
+        outcome.reply_text = f"{outcome.reply_text}{notice}"
     if caller is not None:
         await _touch_health(session, caller, now)
     if outcome.needs_dnd:
