@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import sys
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
@@ -16,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.db import make_engine, make_session_factory, set_bypass
 
 BACKEND = Path(__file__).resolve().parents[1]
-ALEMBIC = os.environ.get("ALEMBIC_BIN", "/tmp/echodesk-venv/bin/alembic")
+_VENDORED_ALEMBIC = Path("/tmp/echodesk-venv/bin/alembic")
 SUPER_URL = os.environ.get("SUPER_DATABASE_URL", "postgresql+asyncpg://echodesk@127.0.0.1:5432/echodesk_test")
 APP_URL = os.environ.get("DATABASE_URL", "postgresql+asyncpg://echodesk_app@127.0.0.1:5432/echodesk_test")
 REDIS_URL = os.environ.get("TEST_REDIS_URL", "redis://127.0.0.1:6379/15")
@@ -83,10 +85,23 @@ def _psql(sql: str, database: str = "postgres") -> str:
     return completed.stdout.strip()
 
 
+def _alembic_program() -> list[str]:
+    override = os.environ.get("ALEMBIC_BIN")
+    if override:
+        return [override]
+    if _VENDORED_ALEMBIC.exists():
+        return [str(_VENDORED_ALEMBIC)]
+    found = shutil.which("alembic")
+    if found:
+        return [found]
+    return [sys.executable, "-m", "alembic"]
+
+
 def _alembic(command: str) -> None:
     env = os.environ.copy()
     env["DATABASE_URL"] = SUPER_URL
-    subprocess.run([ALEMBIC, command, "head" if command == "upgrade" else "base"], cwd=BACKEND, env=env, check=True)
+    target = "head" if command == "upgrade" else "base"
+    subprocess.run([*_alembic_program(), command, target], cwd=BACKEND, env=env, check=True)
 
 
 @pytest.fixture(scope="session")
