@@ -120,6 +120,19 @@ async def pre_dial_gate(
         raise ValueError("now must be timezone-aware UTC")
     if not flags.calling_enabled:
         return block("COMPLIANCE_CIRCUIT_OPEN", "calling_disabled")
+    expired_license = await session.scalar(
+        select(Qualification.id)
+        .where(
+            Qualification.tenant_id == tenant.id,
+            Qualification.doc_type == "business_license",
+            Qualification.expires_at.is_not(None),
+            Qualification.expires_at <= now,
+            Qualification.status.in_(("approved", "expired")),
+        )
+        .limit(1)
+    )
+    if expired_license is not None:
+        return block("COMPLIANCE_QUALIFICATION_MISSING", "qualification_expired")
     if tenant.status != "active":
         return block("COMPLIANCE_QUALIFICATION_MISSING", "tenant_not_active")
     if campaign.scenario_code not in tenant.allowed_scenarios:

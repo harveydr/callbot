@@ -80,6 +80,7 @@ class QualificationBody(BaseModel):
     doc_type: str
     file_key: str
     doc_no: str | None = None
+    expires_at: datetime | None = None
 
 
 class ReviewBody(BaseModel):
@@ -424,7 +425,16 @@ async def add_qualification_route(
     allowed = {"business_license", "telco_value_added_license", "callcenter_license", "number_certificate", "consent_policy", "script_filing", "other"}
     if body.doc_type not in allowed:
         raise ApiError(422, "VALIDATION", "doc_type is invalid")
-    row = Qualification(tenant_id=tenant_id, doc_type=body.doc_type, doc_no=body.doc_no, file_key=body.file_key, status="pending")
+    if body.expires_at is not None and body.expires_at.tzinfo is None:
+        raise ApiError(422, "VALIDATION", "expires_at must be timezone-aware")
+    row = Qualification(
+        tenant_id=tenant_id,
+        doc_type=body.doc_type,
+        doc_no=body.doc_no,
+        file_key=body.file_key,
+        status="pending",
+        expires_at=body.expires_at,
+    )
     session.add(row)
     await session.flush()
     return envelope(request.state.trace_id, {"id": str(row.id), "status": row.status})

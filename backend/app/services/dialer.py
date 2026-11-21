@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.compliance.gate_pre import CampaignView, Flags, TenantView, TrunkView, pre_dial_gate
+from app.compliance.qualification import apply_qualification_clock
 from app.compliance.guard_incall import on_caller_text
 from app.compliance.qc_post import block_followups, review_call, wants_reschedule
 from app.config import Settings
@@ -92,6 +93,7 @@ async def dial_pending(
     if campaign.status != "running":
         return 0
     moment = _aware(now)
+    await apply_qualification_clock(session, tenant, moment)
     bucket = TokenBucket(redis, prefix="")
     flags = Flags(settings.calling_enabled, settings.feature_telesales, settings.feature_collection)
     tasks = (
