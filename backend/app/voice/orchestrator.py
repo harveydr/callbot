@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from app.compliance.opening import render_opening
-from app.llm.prompt import render_intent_prompt, sample_for_attempt
+from app.llm.prompt import render_intent_prompt, render_response_prompt, sample_for_attempt, spoken_line
 from app.compliance.redline import review_assistant_text
 from app.voice.asr import MockAsr, VendorRejected, decode_pcm
 from app.voice.circuit import CircuitPort, VendorCircuit
@@ -128,6 +128,8 @@ def _payloads(llm_mode: str, heard: str) -> list[str | None]:
         return [json.dumps({"intent": "inquiry", "say": "费用是 99 元，合同自动续费。"}, ensure_ascii=False)]
     if llm_mode == "colloquial":
         return [json.dumps({"intent": "inquiry", "say": "一共九十九块。"}, ensure_ascii=False)]
+    if llm_mode == "long_say":
+        return [json.dumps({"intent": "inquiry", "say": "「" + ("甲" * 81) + "」*"}, ensure_ascii=False)]
     if llm_mode == "flagged_stop":
         return [json.dumps({"intent": "inquiry", "demand_stop": True}, ensure_ascii=False)]
     if llm_mode == "flagged_human":
@@ -370,7 +372,7 @@ async def run_session(
             else:
                 intent = "inquiry" if llm_mode != "ok" else classify_intent(heard)
             say = parsed.get("say") if parsed is not None else None
-            if llm_mode in {"priced", "colloquial"} and isinstance(say, str):
+            if llm_mode in {"priced", "colloquial", "long_say"} and isinstance(say, str):
                 model_say = say
             if llm_mode != "hostile":
                 ask_human = parsed.get("ask_human") is True if parsed is not None else False
@@ -413,6 +415,15 @@ async def run_session(
     nodes = parse_nodes(script)
     knowledge = active_knowledge(nodes, intent=intent)
     if model_say and knowledge is not None:
+        model_say = spoken_line(model_say)
+        render_response_prompt(
+            company=company,
+            customer_name="",
+            node_desc=_open_node(script),
+            must_say="".join(mandatory),
+            knowledge=knowledge,
+            history=[],
+        )
         reply = f"{reply}{model_say}"
     reply = confine_to_knowledge(reply, opening, knowledge, mandatory)
     reviewed = review_assistant_text(reply, prior_hits=0, judge=guard_judge, clock=guard_clock)

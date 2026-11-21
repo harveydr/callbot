@@ -11,6 +11,7 @@ _PROMPTS = Path(__file__).resolve().parent / "prompts"
 _CONTRACT = "不得承诺未授权内容、不得隐瞒 AI 身份、不得索取身份证号/银行卡完整号。"
 _BUDGET = 6000
 _HISTORY_TURNS = 8
+_SPOKEN_LIMIT = 80
 
 _ENV = Environment(
     loader=FileSystemLoader(_PROMPTS),
@@ -45,6 +46,53 @@ def clip_history(turns: list[str]) -> tuple[str, list[str]]:
         return "", cleaned
     older = "；".join(cleaned[:-_HISTORY_TURNS])
     return f"前文摘要：{older}", cleaned[-_HISTORY_TURNS:]
+
+
+def spoken_line(text: str) -> str:
+    """Keep one spoken answer inside 80 characters, without quotes or markup."""
+    cleaned = text.strip()
+    for mark in ("*", "【", "】"):
+        cleaned = cleaned.replace(mark, "")
+    while len(cleaned) >= 2 and cleaned[0] in "\"'「」" and cleaned[-1] in "\"'「」":
+        cleaned = cleaned[1:-1].strip()
+    return cleaned[:_SPOKEN_LIMIT]
+
+
+def render_response_prompt(
+    *,
+    company: str,
+    customer_name: str,
+    node_desc: str,
+    must_say: str,
+    knowledge: str,
+    history: list[str],
+) -> str:
+    summary, recent = clip_history(history)
+    kept_summary = summary
+    kept_recent = list(recent)
+    kept_knowledge = knowledge
+    while True:
+        body = _ENV.get_template("response.j2").render(
+            company=company,
+            customer_name=customer_name,
+            node_desc=node_desc or "n_open",
+            must_say=must_say,
+            knowledge=kept_knowledge,
+            history=_history_text(kept_summary, kept_recent),
+        )
+        prompt = f"{body.rstrip()}\n{_CONTRACT}"
+        if len(prompt) <= _BUDGET:
+            return prompt
+        if kept_summary:
+            kept_summary = ""
+            continue
+        if kept_recent:
+            kept_recent.pop(0)
+            continue
+        if len(kept_knowledge) > 200:
+            kept_knowledge = kept_knowledge[: len(kept_knowledge) // 2]
+            continue
+        return prompt
 
 
 def render_intent_prompt(

@@ -31,7 +31,7 @@ from tests.test_dispatch import _world
 from app.voice.asr import MockAsr
 from app.voice.circuit import SharedVendorCircuit, VendorCircuit
 from app.voice.orchestrator import Frame, caller_frames, run_session
-from app.voice.script import confine_to_knowledge
+from app.voice.script import confine_to_knowledge, parse_nodes
 from app.voice.tts import MockTts
 
 NOW = datetime(2026, 11, 22, 2, 0, tzinfo=timezone.utc)
@@ -426,6 +426,35 @@ def test_a_colloquial_amount_is_a_price_claim() -> None:
     assert "必须播报。" in refused
     assert "不在本次说明范围内" in refused
     assert plain == f"{opening}请到第一单元。"
+
+
+async def test_a_free_answer_stays_within_eighty_characters() -> None:
+    outcome = await run_session(
+        [Frame("caller", "PCM:请问一下".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        llm_mode="long_say",
+        script=_priced_script("只通知时间。"),
+    )
+    assert outcome.reply_text.count("甲") == 80
+    assert "「" not in outcome.reply_text
+    assert "*" not in outcome.reply_text
+    assert "必须播报的开场要点。" in outcome.reply_text
+    assert opening_is_complete(outcome.reply_text)
+
+
+def test_a_fourth_knowledge_fragment_is_outside_the_node() -> None:
+    nodes = parse_nodes(
+        [
+            {
+                "node_key": "n_free",
+                "node_type": "llm_free",
+                "content": {"knowledge": ["只通知时间。", "请准时。", "门口集合。", "保修三年。"]},
+            }
+        ]
+    )
+    assert "保修" not in nodes[0].knowledge
+    assert "门口集合。" in nodes[0].knowledge
 
 
 async def test_a_free_answer_cannot_leave_the_node_knowledge() -> None:

@@ -46,7 +46,8 @@ def parse_nodes(raw: list[dict[str, object]] | None) -> list[ScriptNode]:
         if isinstance(raw_knowledge, str):
             knowledge = raw_knowledge
         elif isinstance(raw_knowledge, list):
-            knowledge = "".join(item for item in raw_knowledge if isinstance(item, str))
+            parts = [item.strip() for item in raw_knowledge if isinstance(item, str) and item.strip()]
+            knowledge = "".join(parts[:3])
         else:
             knowledge = ""
         key = item.get("node_key") or item.get("id") or ""
