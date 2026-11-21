@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Call, CallEvent
+from app.models import Call, CallEvent, Tenant
 from app.models.extra import Alert, BillingDispute, BillingItem
 
 
@@ -188,4 +189,53 @@ async def reconcile_vendor_bill(
         if await _open_dispute(session, call=call, item=item, reason="vendor_bill_missing", now=moment):
             opened += 1
     await session.flush()
+    return opened
+
+
+def previous_local_day(now: datetime, timezone_name: str) -> tuple[datetime, datetime]:
+    """Return yesterday's half-open interval in UTC for the tenant's calendar."""
+    zone = ZoneInfo(timezone_name or "Asia/Shanghai")
+    local_now = _aware(now).astimezone(zone)
+    end = datetime(local_now.year, local_now.month, local_now.day, tzinfo=zone)
+    start = end - timedelta(days=1)
+    return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+
+
+async def reconcile_previous_day(session: AsyncSession, now: datetime) -> int:
+    """Dispute completed calls from the previous local day that have no vendor CDR. Prices stay put."""
+    moment = _aware(now)
+    tenants = (
+        await session.scalars(select(Tenant).where(Tenant.status.in_(("pending", "active", "suspended"))))
+    ).all()
+    opened = 0
+    for tenant in tenants:
+        start, end = previous_local_day(moment, tenant.timezone)
+        calls = (
+            await session.scalars(
+                select(Call).where(
+                    Call.tenant_id == tenant.id,
+                    Call.status == "completed",
+                    Call.start_at.is_not(None),
+                    Call.start_at >= start,
+                    Call.start_at < end,
+                )
+            )
+        ).all()
+        present: set[uuid.UUID] = set()
+        for call in calls:
+            applied = await session.scalar(
+                select(CallEvent.id)
+                .where(CallEvent.call_id == call.id, CallEvent.event_type == "cdr_applied")
+                .limit(1)
+            )
+            if applied is not None:
+                present.add(call.call_uuid)
+        opened += await reconcile_vendor_bill(
+            session,
+            tenant_id=tenant.id,
+            present_call_uuids=present,
+            period_start=start,
+            period_end=end,
+            now=moment,
+        )
     return opened

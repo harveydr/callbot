@@ -14,7 +14,8 @@ from app.models import Call, CallEvent, Campaign, Contact, ContactList, Scenario
 from app.models.extra import Alert, BillingDispute, BillingItem
 from app.security.crypto import encrypt_phone, phone_hash
 from app.services.exports import export_expires_at, export_is_usable
-from app.tasks.billing import VendorCdr, apply_vendor_cdr, duration_gap, reconcile_vendor_bill
+from app.tasks import celery_app
+from app.tasks.billing import VendorCdr, apply_vendor_cdr, duration_gap, reconcile_previous_day, reconcile_vendor_bill
 
 NOW = datetime(2026, 11, 22, 2, 0, tzinfo=timezone.utc)
 KEY = __import__("base64").b64decode("AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=")
@@ -256,6 +257,87 @@ async def test_local_call_missing_from_the_vendor_bill_is_disputed_once(
         assert second == 0
         assert item is not None and item.amount == Decimal("1.5000")
         assert dispute is not None and dispute.reason == "vendor_bill_missing"
+
+
+async def test_previous_local_day_reconcile_skips_calls_with_a_vendor_cdr(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    job_at = datetime(2026, 11, 22, 18, 0, tzinfo=timezone.utc)
+    async with session_factory() as session:
+        listed = await _call(session, amount=Decimal("1.0000"))
+        missing = Call(
+            tenant_id=listed.tenant_id,
+            campaign_id=listed.campaign_id,
+            contact_id=listed.contact_id,
+            call_uuid=uuid.uuid4(),
+            status="completed",
+            trunk_id=listed.trunk_id,
+            template_version=1,
+            duration_sec=40,
+            start_at=NOW,
+            end_at=NOW,
+        )
+        outside = Call(
+            tenant_id=listed.tenant_id,
+            campaign_id=listed.campaign_id,
+            contact_id=listed.contact_id,
+            call_uuid=uuid.uuid4(),
+            status="completed",
+            trunk_id=listed.trunk_id,
+            template_version=1,
+            duration_sec=40,
+            start_at=datetime(2026, 11, 20, 2, 0, tzinfo=timezone.utc),
+            end_at=datetime(2026, 11, 20, 2, 0, tzinfo=timezone.utc),
+        )
+        session.add_all([missing, outside])
+        await session.flush()
+        session.add(
+            CallEvent(
+                tenant_id=listed.tenant_id,
+                call_id=listed.id,
+                event_type="cdr_applied",
+                detail={"vendor_event_id": "evt-day"},
+            )
+        )
+        session.add(
+            BillingItem(
+                tenant_id=listed.tenant_id,
+                call_id=missing.id,
+                call_uuid=missing.call_uuid,
+                amount=Decimal("2.0000"),
+                currency="CNY",
+                rate_note="quoted",
+            )
+        )
+        closed = await _call(session, amount=Decimal("3.0000"))
+        closed_tenant = await session.get(Tenant, closed.tenant_id)
+        assert closed_tenant is not None
+        closed_tenant.status = "closed"
+        await session.flush()
+        first = await reconcile_previous_day(session, job_at)
+        second = await reconcile_previous_day(session, job_at)
+        missing_item = await session.scalar(select(BillingItem).where(BillingItem.call_uuid == missing.call_uuid))
+        listed_item = await session.scalar(select(BillingItem).where(BillingItem.call_uuid == listed.call_uuid))
+        disputes = (
+            await session.scalars(select(BillingDispute).where(BillingDispute.tenant_id == listed.tenant_id))
+        ).all()
+        closed_dispute = await session.scalar(select(BillingDispute.id).where(BillingDispute.tenant_id == closed.tenant_id))
+        assert first == 1
+        assert second == 0
+        assert missing_item is not None and missing_item.amount == Decimal("2.0000")
+        assert listed_item is not None and listed_item.amount == Decimal("1.0000")
+        assert len(disputes) == 1
+        assert disputes[0].billing_item_id == missing_item.id
+        assert disputes[0].reason == "vendor_bill_missing"
+        assert closed_dispute is None
+
+
+def test_vendor_bill_reconcile_is_scheduled_at_two() -> None:
+    entry = celery_app.conf.beat_schedule["reconcile-vendor-bills"]
+    assert entry["task"] == "billing_reconcile"
+    assert celery_app.conf.timezone == "Asia/Shanghai"
+    assert entry["schedule"].hour == {2}
+    assert entry["schedule"].minute == {0}
 
 
 def test_export_link_expires_after_fifteen_minutes() -> None:

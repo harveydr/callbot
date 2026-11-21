@@ -19,6 +19,10 @@ celery_app.conf.update(
             "task": "sweep_qualifications",
             "schedule": crontab(hour=0, minute=10),
         },
+        "reconcile-vendor-bills": {
+            "task": "billing_reconcile",
+            "schedule": crontab(hour=2, minute=0),
+        },
     },
     task_routes={
         "dispatch_campaign": {"queue": "dispatch"},
@@ -30,4 +34,5 @@ celery_app.conf.update(
 )
 app = celery_app
 
+from app.tasks import billing_schedule as billing_schedule_task  # noqa: E402,F401
 from app.tasks import qualification as qualification_task  # noqa: E402,F401
