@@ -10,6 +10,7 @@ import redis.asyncio as redis_async
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.compliance.cache import load_template_script, remember_dnd
 from app.compliance.gate_pre import CampaignView, Flags, TenantView, TrunkView, pre_dial_gate
 from app.compliance.qualification import apply_qualification_clock
 from app.compliance.guard_incall import on_caller_text
@@ -24,7 +25,6 @@ from app.models.extra import (
     CallTurn,
     QcResult,
     Recording,
-    ScriptNode,
     Transcript,
 )
 from app.services.billing_budget import apply_billing_budget
@@ -177,6 +177,7 @@ async def dial_pending(
                 flags=flags,
                 minor=contact.minor,
                 template_id=campaign.template_id,
+                redis=redis,
             )
             if not decision.allowed:
                 await _blocked(session, campaign, contact, task, decision.code or "", decision.block_reason or "", moment)
@@ -461,12 +462,7 @@ async def _place(
     caller: CallerNumber | None,
 ) -> None:
     frames = [] if heard == "无人接听" else [Frame("caller", f"PCM:{heard}".encode("utf-8"))]
-    script_rows = (
-        await session.scalars(select(ScriptNode).where(ScriptNode.template_id == campaign.template_id).order_by(ScriptNode.node_key))
-    ).all()
-    script: list[dict[str, object]] = []
-    for row in script_rows:
-        script.append({"node_key": row.node_key, "node_type": row.node_type, "content": row.content})
+    script = await load_template_script(session, redis, campaign.template_id)
     asr_circuit = SharedVendorCircuit(settings.redis_url, "asr")
     tts_circuit = SharedVendorCircuit(settings.redis_url, "tts")
     llm_circuit = SharedVendorCircuit(settings.redis_url, "llm")
@@ -535,7 +531,7 @@ async def _place(
     if caller is not None:
         await _touch_health(session, caller, now)
     if outcome.needs_dnd:
-        await on_caller_text(
+        in_call = await on_caller_text(
             session,
             tenant_id=campaign.tenant_id,
             call_id=call.id,
@@ -546,6 +542,8 @@ async def _place(
             purpose=campaign.name,
             opening_played=True,
         )
+        if in_call.dnd_written:
+            await remember_dnd(redis, tenant_id=campaign.tenant_id, phone_hash=contact.phone_hash)
     task.status = "done"
     session.add(
         CallTurn(

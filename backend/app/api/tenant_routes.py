@@ -29,6 +29,7 @@ from app.api.surface import (
     finish,
     tenant_router,
 )
+from app.compliance.cache import forget_dnd, forget_template, remember_consent, remember_dnd, revoke_consent_cache
 from app.db import set_tenant
 from app.deps import Principal, current_principal, db_session, require_roles, require_tenant
 from app.errors import ApiError
@@ -337,6 +338,14 @@ async def create_consent(
     )
     session.add(row)
     await session.flush()
+    await remember_consent(
+        request.app.state.redis,
+        tenant_id=tenant_id,
+        phone_hash=row.phone_hash,
+        scenario=row.scenario_code,
+        consented_at=row.consented_at,
+        expires_at=row.expires_at,
+    )
     return envelope(request.state.trace_id, {"id": str(row.id), "phone_last4": row.phone_last4})
 
 
@@ -373,6 +382,12 @@ async def revoke_consent(
         raise ApiError(404, "NOT_FOUND", "consent not found")
     row.revoked = True
     row.revoked_at = utcnow()
+    await revoke_consent_cache(
+        request.app.state.redis,
+        tenant_id=row.tenant_id,
+        phone_hash=row.phone_hash,
+        scenario=row.scenario_code,
+    )
     return envelope(request.state.trace_id, {"id": str(row.id), "revoked": True})
 
 
@@ -780,6 +795,7 @@ async def add_dnd(
     )
     session.add(row)
     await session.flush()
+    await remember_dnd(request.app.state.redis, tenant_id=tenant_id, phone_hash=row.phone_hash)
     return envelope(request.state.trace_id, {"id": str(row.id), "phone_last4": row.phone_last4})
 
 
@@ -797,7 +813,11 @@ async def delete_dnd(
         raise ApiError(404, "NOT_FOUND", "dnd entry not found")
     if row.source != "operator_manual":
         raise ApiError(403, "FORBIDDEN", "this entry can only be removed by dual-controlled platform review")
+    phone_hash = row.phone_hash
+    tenant_id = row.tenant_id
     await session.delete(row)
+    if tenant_id is not None:
+        await forget_dnd(request.app.state.redis, tenant_id=tenant_id, phone_hash=phone_hash)
     return envelope(request.state.trace_id, {"deleted": True})
 
 
@@ -821,6 +841,7 @@ async def create_complaint(
             user_id=principal.user_id,
             trace_id=request.state.trace_id,
             call_id=body.call_id,
+            redis=request.app.state.redis,
         )
         return 200, data
 
@@ -1030,4 +1051,5 @@ async def save_nodes(
     row.version += 1
     row.status = "draft"
     row.updated_at = utcnow()
+    await forget_template(request.app.state.redis, row.id)
     return envelope(request.state.trace_id, {"id": str(row.id), "version": row.version, "status": row.status})

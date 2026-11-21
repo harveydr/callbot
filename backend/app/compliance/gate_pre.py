@@ -5,10 +5,13 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from typing import cast
 
+import redis.asyncio as redis_async
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.compliance.cache import consent_allows, dnd_reason, load_template_script
 from app.compliance.windows import (
     effective_freq_30d,
     effective_freq_7d,
@@ -119,6 +122,7 @@ async def pre_dial_gate(
     flags: Flags,
     minor: bool = False,
     template_id: uuid.UUID | None = None,
+    redis: redis_async.Redis | None = None,
 ) -> GateDecision:
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware UTC")
@@ -163,27 +167,40 @@ async def pre_dial_gate(
     if trunk.status != "active" or campaign.scenario_code not in trunk.allowed_scenarios:
         return block("COMPLIANCE_SCENARIO_NOT_ALLOWED", "trunk_scenario_mismatch")
 
-    platform_hit = await session.scalar(select(PlatformDnd.id).where(PlatformDnd.phone_hash == phone_hash).limit(1))
-    if platform_hit is not None:
-        return block("COMPLIANCE_DND_HIT", "platform_dnd")
-    tenant_hit = await session.scalar(
-        select(DndEntry.id)
-        .where(DndEntry.tenant_id == tenant.id, DndEntry.phone_hash == phone_hash)
-        .limit(1)
-    )
-    if tenant_hit is not None:
-        return block("COMPLIANCE_DND_HIT", "tenant_dnd")
-
-    consent = await session.scalar(
-        select(ConsentRecord).where(
-            ConsentRecord.tenant_id == tenant.id,
-            ConsentRecord.phone_hash == phone_hash,
-            ConsentRecord.scenario_code == campaign.scenario_code,
-            ConsentRecord.revoked.is_(False),
+    if redis is None:
+        platform_hit = await session.scalar(select(PlatformDnd.id).where(PlatformDnd.phone_hash == phone_hash).limit(1))
+        if platform_hit is not None:
+            return block("COMPLIANCE_DND_HIT", "platform_dnd")
+        tenant_hit = await session.scalar(
+            select(DndEntry.id)
+            .where(DndEntry.tenant_id == tenant.id, DndEntry.phone_hash == phone_hash)
+            .limit(1)
         )
-    )
-    if consent is None or consent.consented_at > now or (consent.expires_at is not None and consent.expires_at <= now):
-        return block("COMPLIANCE_NO_CONSENT", "no_valid_consent")
+        if tenant_hit is not None:
+            return block("COMPLIANCE_DND_HIT", "tenant_dnd")
+        consent = await session.scalar(
+            select(ConsentRecord).where(
+                ConsentRecord.tenant_id == tenant.id,
+                ConsentRecord.phone_hash == phone_hash,
+                ConsentRecord.scenario_code == campaign.scenario_code,
+                ConsentRecord.revoked.is_(False),
+            )
+        )
+        if consent is None or consent.consented_at > now or (consent.expires_at is not None and consent.expires_at <= now):
+            return block("COMPLIANCE_NO_CONSENT", "no_valid_consent")
+    else:
+        reason = await dnd_reason(session, redis, tenant_id=tenant.id, phone_hash=phone_hash)
+        if reason is not None:
+            return block("COMPLIANCE_DND_HIT", reason)
+        if not await consent_allows(
+            session,
+            redis,
+            tenant_id=tenant.id,
+            phone_hash=phone_hash,
+            scenario=campaign.scenario_code,
+            now=now,
+        ):
+            return block("COMPLIANCE_NO_CONSENT", "no_valid_consent")
 
     tz_name = campaign.timezone or tenant.timezone
     window_reason = window_block_reason(now, timezone_name=tz_name, call_window=campaign.call_window)
@@ -230,7 +247,7 @@ async def pre_dial_gate(
     if int(tenant_calls or 0) >= tenant.daily_call_quota:
         return block("QUOTA_EXCEEDED", "daily_call_quota")
     if minor:
-        return await _guardian_gate(session, tenant_id=tenant.id, template_id=template_id, now=now)
+        return await _guardian_gate(session, tenant_id=tenant.id, template_id=template_id, now=now, redis=redis)
     return allow()
 
 
@@ -240,6 +257,7 @@ async def _guardian_gate(
     tenant_id: uuid.UUID,
     template_id: uuid.UUID | None,
     now: datetime,
+    redis: redis_async.Redis | None,
 ) -> GateDecision:
     consents = (
         await session.scalars(
@@ -254,7 +272,20 @@ async def _guardian_gate(
         return block("COMPLIANCE_QUALIFICATION_MISSING", "guardian_consent_missing")
     if template_id is None:
         return block("COMPLIANCE_SCRIPT_INVALID", "guardian_script_missing")
-    nodes = (await session.scalars(select(ScriptNode).where(ScriptNode.template_id == template_id))).all()
-    if not any(guardian_line(node.node_key, node.node_type, node.content) for node in nodes):
+    script: list[dict[str, object]]
+    if redis is None:
+        nodes = (await session.scalars(select(ScriptNode).where(ScriptNode.template_id == template_id))).all()
+        script = [{"node_key": node.node_key, "node_type": node.node_type, "content": node.content} for node in nodes]
+    else:
+        script = await load_template_script(session, redis, template_id)
+    spoken = False
+    for node in script:
+        content = node.get("content")
+        if not isinstance(content, dict):
+            continue
+        if guardian_line(str(node.get("node_key") or ""), str(node.get("node_type") or ""), cast(dict[str, object], content)):
+            spoken = True
+            break
+    if not spoken:
         return block("COMPLIANCE_SCRIPT_INVALID", "guardian_script_missing")
     return allow()

@@ -17,6 +17,7 @@ import redis.asyncio as redis_async
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.compliance.cache import remember_dnd
 from app.config import Settings
 from app.db import set_bypass, set_tenant
 from app.errors import ApiError
@@ -642,6 +643,7 @@ async def open_complaint(
     user_id: uuid.UUID,
     trace_id: str,
     call_id: uuid.UUID | None,
+    redis: redis_async.Redis | None = None,
 ) -> dict[str, object]:
     try:
         normalized = normalize_phone(phone)
@@ -671,6 +673,8 @@ async def open_complaint(
         )
     await _block_caller_if_complaint_rate(session, tenant_id=tenant_id, call_id=call_id)
     await session.flush()
+    if redis is not None:
+        await remember_dnd(redis, tenant_id=tenant_id, phone_hash=hashed)
     await audit(session, tenant_id=tenant_id, user_id=user_id, action="complaint.create", target_type="complaint", target_id=str(complaint.id), detail={"phone": mask_phone(normalized)}, trace_id=trace_id)
     return {"id": str(complaint.id), "phone_last4": complaint.phone_last4, "status": complaint.status, "dnd": True}
 
