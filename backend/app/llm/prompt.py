@@ -49,13 +49,29 @@ def clip_history(turns: list[str]) -> tuple[str, list[str]]:
 
 
 def spoken_line(text: str) -> str:
-    """Keep one spoken answer inside 80 characters, without quotes or markup."""
+    """Keep at most two sentences and 80 characters, without quotes or markup."""
     cleaned = text.strip()
     for mark in ("*", "【", "】"):
         cleaned = cleaned.replace(mark, "")
     while len(cleaned) >= 2 and cleaned[0] in "\"'「」" and cleaned[-1] in "\"'「」":
         cleaned = cleaned[1:-1].strip()
-    return cleaned[:_SPOKEN_LIMIT]
+    sentences: list[str] = []
+    current = ""
+    for char in cleaned:
+        current += char
+        if char in "。！？":
+            sentences.append(current)
+            current = ""
+    if current:
+        sentences.append(current)
+    chosen = "".join(sentences[:2])
+    if len(chosen) <= _SPOKEN_LIMIT:
+        return chosen
+    window = chosen[:_SPOKEN_LIMIT]
+    cut = max(window.rfind(mark) for mark in "。！？")
+    if cut >= 0:
+        return window[: cut + 1]
+    return window
 
 
 def render_response_prompt(

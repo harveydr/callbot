@@ -428,6 +428,35 @@ def test_a_colloquial_amount_is_a_price_claim() -> None:
     assert plain == f"{opening}请到第一单元。"
 
 
+async def test_a_refusal_is_not_followed_by_another_pitch() -> None:
+    kept = "您再考虑一下。这是最后一次优惠。"
+    refused = await run_session(
+        [Frame("caller", "PCM:不用了".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        llm_mode="retain",
+        script=_priced_script(kept),
+    )
+    stopped = await run_session(
+        [Frame("caller", "PCM:请勿再来电".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        llm_mode="retain_stop",
+        script=_priced_script(kept),
+    )
+    assert refused.intent == "refuse"
+    assert refused.action == "hangup"
+    assert "再考虑一下" not in refused.reply_text
+    assert "最后一次优惠" not in refused.reply_text
+    assert "必须播报的开场要点。" in refused.reply_text
+    assert opening_is_complete(refused.reply_text)
+    assert stopped.demand_stop is True
+    assert stopped.action == "hangup"
+    assert "再考虑一下" not in stopped.reply_text
+    assert "已为您登记不再来电" in stopped.reply_text
+    assert opening_is_complete(stopped.reply_text)
+
+
 async def test_a_free_answer_stays_within_eighty_characters() -> None:
     outcome = await run_session(
         [Frame("caller", "PCM:请问一下".encode("utf-8"))],

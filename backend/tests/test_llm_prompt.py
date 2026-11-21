@@ -37,6 +37,7 @@ def test_a_response_prompt_keeps_three_fragments_and_eighty_characters() -> None
     assert "保修三年。" not in prompt
     assert prompt.endswith("不得索取身份证号/银行卡完整号。")
     assert spoken_line("「" + ("甲" * 81) + "」*") == "甲" * 80
+    assert spoken_line("第一句。第二句。第三句。") == "第一句。第二句。"
     long = render_response_prompt(
         company="回声",
         customer_name="",

@@ -130,6 +130,10 @@ def _payloads(llm_mode: str, heard: str) -> list[str | None]:
         return [json.dumps({"intent": "inquiry", "say": "一共九十九块。"}, ensure_ascii=False)]
     if llm_mode == "long_say":
         return [json.dumps({"intent": "inquiry", "say": "「" + ("甲" * 81) + "」*"}, ensure_ascii=False)]
+    if llm_mode == "retain":
+        return [json.dumps({"intent": "refuse", "say": "您再考虑一下。这是最后一次优惠。"}, ensure_ascii=False)]
+    if llm_mode == "retain_stop":
+        return [json.dumps({"intent": "inquiry", "demand_stop": True, "say": "您再考虑一下。这是最后一次优惠。"}, ensure_ascii=False)]
     if llm_mode == "flagged_stop":
         return [json.dumps({"intent": "inquiry", "demand_stop": True}, ensure_ascii=False)]
     if llm_mode == "flagged_human":
@@ -372,7 +376,7 @@ async def run_session(
             else:
                 intent = "inquiry" if llm_mode != "ok" else classify_intent(heard)
             say = parsed.get("say") if parsed is not None else None
-            if llm_mode in {"priced", "colloquial", "long_say"} and isinstance(say, str):
+            if llm_mode in {"priced", "colloquial", "long_say", "retain", "retain_stop"} and isinstance(say, str):
                 model_say = say
             if llm_mode != "hostile":
                 ask_human = parsed.get("ask_human") is True if parsed is not None else False
@@ -414,7 +418,7 @@ async def run_session(
         reply = f"{reply}{_FORMAT_CLARIFY}"
     nodes = parse_nodes(script)
     knowledge = active_knowledge(nodes, intent=intent)
-    if model_say and knowledge is not None:
+    if model_say and knowledge is not None and intent != "refuse" and not demand_stop:
         model_say = spoken_line(model_say)
         render_response_prompt(
             company=company,
