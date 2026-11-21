@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.compliance.gate_pre import CampaignView, Flags, TenantView, TrunkView, pre_dial_gate
 from app.compliance.guard_incall import on_caller_text
-from app.compliance.opening import opening_is_complete
+from app.compliance.qc_post import block_followups, review_call, wants_reschedule
 from app.config import Settings
 from app.models import Call, CallEvent, CallerNumber, Campaign, Contact, Task, Tenant, Trunk, User
 from app.models.extra import (
@@ -209,6 +209,18 @@ async def _handoff(
             detail={"status": "failed", "no_agent_action": "callback_30min"},
         )
     )
+    await _callback(session, campaign, contact, task, call, now, timedelta(minutes=30))
+
+
+async def _callback(
+    session: AsyncSession,
+    campaign: Campaign,
+    contact: Contact,
+    task: Task,
+    call: Call,
+    now: datetime,
+    delay: timedelta,
+) -> None:
     attempt_no = task.attempt_no + 1
     exists = await session.scalar(
         select(Task.id).where(
@@ -223,9 +235,17 @@ async def _handoff(
                 contact_id=contact.id,
                 attempt_no=attempt_no,
                 status="pending",
-                next_run_at=now + timedelta(minutes=30),
+                next_run_at=now + delay,
             )
         )
+    session.add(
+        CallEvent(
+            tenant_id=campaign.tenant_id,
+            call_id=call.id,
+            event_type="callback",
+            detail={"next_run_at": (now + delay).isoformat()},
+        )
+    )
 
 
 async def _touch_health(session: AsyncSession, caller: CallerNumber, *, answered: bool, now: datetime) -> None:
@@ -367,6 +387,8 @@ async def _place(
     await session.flush()
     if status == "transferring":
         await _handoff(session, campaign, contact, task, call, now)
+    elif status == "completed" and wants_reschedule(heard):
+        await _callback(session, campaign, contact, task, call, now, timedelta(days=1))
     if caller is not None:
         await _touch_health(session, caller, answered=status == "completed", now=now)
     if outcome.needs_dnd:
@@ -416,12 +438,22 @@ async def _place(
             retain_until=now + timedelta(days=180),
         )
     )
+    turns: list[dict[str, str]] = [{"speaker": "assistant", "text": outcome.reply_text}]
+    if outcome.heard:
+        turns.append({"speaker": "caller", "text": outcome.heard})
+    review = review_call(
+        assistant=outcome.reply_text,
+        caller=outcome.heard,
+        grade=outcome.intent_grade,
+        redline_hits=outcome.redline_hits,
+        transcript_present=True,
+    )
     session.add(
         Transcript(
             tenant_id=campaign.tenant_id,
             call_id=call.id,
-            body={"explicit_label": EXPLICIT_AIGC, "turns": [{"speaker": "assistant", "text": outcome.reply_text}]},
-            summary=None,
+            body={"explicit_label": EXPLICIT_AIGC, "turns": turns},
+            summary=review.summary,
             created_by=campaign.created_by,
         )
     )
@@ -429,10 +461,12 @@ async def _place(
         QcResult(
             tenant_id=campaign.tenant_id,
             call_id=call.id,
-            result="pass" if opening_is_complete(outcome.reply_text) else "fail",
-            detail={"ai_notice_present": opening_is_complete(outcome.reply_text), "summary": None},
+            result=review.result,
+            detail=review.detail,
         )
     )
+    if review.block_script:
+        await block_followups(session, campaign)
     session.add(
         CallEvent(
             tenant_id=campaign.tenant_id,

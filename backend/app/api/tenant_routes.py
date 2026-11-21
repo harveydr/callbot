@@ -584,7 +584,18 @@ async def get_call(
     if principal.role == "operator" and call.created_by != principal.user_id:
         raise ApiError(403, "FORBIDDEN", "operator can only read calls they started")
     turns = await load_turns(session, call.id)
-    return envelope(request.state.trace_id, {"id": str(call.id), "status": call.status, "template_version": call.template_version, "turns": turns, "summary": None})
+    transcript_row = await session.scalar(select(Transcript).where(Transcript.call_id == call.id))
+    summary = None if transcript_row is None else transcript_row.summary
+    return envelope(
+        request.state.trace_id,
+        {
+            "id": str(call.id),
+            "status": call.status,
+            "template_version": call.template_version,
+            "turns": turns,
+            "summary": summary,
+        },
+    )
 
 
 @tenant_router.get("/calls/{call_id}/transcript")

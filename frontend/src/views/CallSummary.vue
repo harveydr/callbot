@@ -2,7 +2,8 @@
   <div>
     <h1>通话小结</h1>
     <StateView :status="status" :message="message" @retry="load">
-      <p>{{ note }}</p>
+      <p v-if="summary">{{ summary }}</p>
+      <p v-else>{{ note }}</p>
       <el-table :data="turns">
         <el-table-column prop="speaker" label="说话方" />
         <el-table-column prop="text" label="内容" />
@@ -21,12 +22,14 @@ const route = useRoute();
 const status = ref("loading");
 const message = ref("");
 const note = ref("");
+const summary = ref("");
 const turns = ref([]);
 
 async function load() {
   try {
     const response = await api.get(`/api/t/calls/${route.params.id}/transcript`);
     note.value = response.data.data.note;
+    summary.value = response.data.data.summary || "";
     turns.value = response.data.data.body?.turns || [];
     status.value = "ready";
   } catch (err) {
