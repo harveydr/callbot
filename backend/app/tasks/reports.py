@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from app.config import load_settings
 from app.db import make_engine, make_session_factory, set_bypass
 from app.services.exports import render_report
-from app.tasks import celery_app
+from app.tasks import durable_task
 
 
 async def _run(export_id: str) -> str:
@@ -26,6 +26,6 @@ async def _run(export_id: str) -> str:
         await engine.dispose()
 
 
-@celery_app.task(name="render_report")
+@durable_task(name="render_report")
 def render_report_task(export_id: str) -> str:
     return asyncio.run(_run(export_id))

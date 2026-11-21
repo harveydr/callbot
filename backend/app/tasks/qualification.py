@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from app.compliance.qualification import sweep_qualifications
 from app.config import load_settings
 from app.db import make_engine, make_session_factory, set_bypass
-from app.tasks import celery_app
+from app.tasks import durable_task
 
 
 async def _run_sweep() -> str:
@@ -25,6 +25,6 @@ async def _run_sweep() -> str:
         await engine.dispose()
 
 
-@celery_app.task(name="sweep_qualifications")
+@durable_task(name="sweep_qualifications")
 def sweep_qualifications_task() -> str:
     return asyncio.run(_run_sweep())

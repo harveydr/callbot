@@ -52,6 +52,18 @@ celery_app.conf.update(
         "render_report": {"time_limit": 300},
     },
 )
+
+
+def durable_task(*args: object, **kwargs: object):
+    """Retry a failed worker task three times, waiting 1s, 2s, then 4s."""
+    kwargs.setdefault("autoretry_for", (Exception,))
+    kwargs.setdefault("retry_backoff", True)
+    kwargs.setdefault("retry_backoff_max", 60)
+    kwargs.setdefault("retry_jitter", False)
+    kwargs.setdefault("max_retries", 3)
+    return celery_app.task(*args, **kwargs)
+
+
 app = celery_app
 
 from app.tasks import billing_schedule as billing_schedule_task  # noqa: E402,F401

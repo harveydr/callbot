@@ -14,7 +14,7 @@ from app.services.ops_alerts import raise_ops_alerts
 from app.config import Settings, load_settings
 from app.db import make_engine, make_session_factory, set_bypass
 from app.services.dialer import dispatch_campaign_due, dispatch_due
-from app.tasks import celery_app
+from app.tasks import durable_task
 
 
 async def _open() -> tuple[Settings, AsyncEngine, async_sessionmaker[AsyncSession], redis_async.Redis]:
@@ -60,11 +60,11 @@ async def _run_due() -> str:
         await engine.dispose()
 
 
-@celery_app.task(name="dispatch_campaign")
+@durable_task(name="dispatch_campaign")
 def dispatch_campaign(campaign_id: str, tenant_id: str) -> str:
     return asyncio.run(_run_one(campaign_id, tenant_id))
 
 
-@celery_app.task(name="dispatch_due_campaigns")
+@durable_task(name="dispatch_due_campaigns")
 def dispatch_due_campaigns() -> str:
     return asyncio.run(_run_due())

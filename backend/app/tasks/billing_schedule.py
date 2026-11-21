@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 from app.config import load_settings
 from app.db import make_engine, make_session_factory, set_bypass
-from app.tasks import celery_app
+from app.tasks import durable_task
 from app.tasks.billing import probe_missing_cdr, reconcile_previous_day, unavailable_cdr
 
 
@@ -39,11 +39,11 @@ async def _run_probe() -> str:
         await engine.dispose()
 
 
-@celery_app.task(name="billing_reconcile")
+@durable_task(name="billing_reconcile")
 def billing_reconcile_task() -> str:
     return asyncio.run(_run_reconcile())
 
 
-@celery_app.task(name="probe_missing_cdr")
+@durable_task(name="probe_missing_cdr")
 def probe_missing_cdr_task() -> str:
     return asyncio.run(_run_probe())
