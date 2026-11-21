@@ -16,7 +16,9 @@ from app.compliance.windows import (
     local_period_start,
     window_block_reason,
 )
+from app.compliance.guardian import guardian_line
 from app.models import Call, ConsentRecord, Contact, DndEntry, PlatformDnd, Qualification
+from app.models.extra import ScriptNode
 
 _DIALED = (
     "queued",
@@ -115,6 +117,8 @@ async def pre_dial_gate(
     phone_hash: str,
     now: datetime,
     flags: Flags,
+    minor: bool = False,
+    template_id: uuid.UUID | None = None,
 ) -> GateDecision:
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware UTC")
@@ -225,4 +229,32 @@ async def pre_dial_gate(
     )
     if int(tenant_calls or 0) >= tenant.daily_call_quota:
         return block("QUOTA_EXCEEDED", "daily_call_quota")
+    if minor:
+        return await _guardian_gate(session, tenant_id=tenant.id, template_id=template_id, now=now)
+    return allow()
+
+
+async def _guardian_gate(
+    session: AsyncSession,
+    *,
+    tenant_id: uuid.UUID,
+    template_id: uuid.UUID | None,
+    now: datetime,
+) -> GateDecision:
+    consents = (
+        await session.scalars(
+            select(Qualification).where(
+                Qualification.tenant_id == tenant_id,
+                Qualification.doc_type == "guardian_consent",
+                Qualification.status == "approved",
+            )
+        )
+    ).all()
+    if not any(row.expires_at is None or row.expires_at > now for row in consents):
+        return block("COMPLIANCE_QUALIFICATION_MISSING", "guardian_consent_missing")
+    if template_id is None:
+        return block("COMPLIANCE_SCRIPT_INVALID", "guardian_script_missing")
+    nodes = (await session.scalars(select(ScriptNode).where(ScriptNode.template_id == template_id))).all()
+    if not any(guardian_line(node.node_key, node.node_type, node.content) for node in nodes):
+        return block("COMPLIANCE_SCRIPT_INVALID", "guardian_script_missing")
     return allow()

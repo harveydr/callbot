@@ -278,7 +278,18 @@ async def list_contacts(
     ).all()
     return envelope(
         request.state.trace_id,
-        {"items": [{"id": str(row.id), "phone_last4": row.phone_last4, "dial_class": row.dial_class, "display_name": row.display_name} for row in rows]},
+        {
+            "items": [
+                {
+                    "id": str(row.id),
+                    "phone_last4": row.phone_last4,
+                    "dial_class": row.dial_class,
+                    "display_name": row.display_name,
+                    "minor": row.minor,
+                }
+                for row in rows
+            ]
+        },
     )
 
 

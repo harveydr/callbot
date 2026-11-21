@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from app.compliance.guardian import guardian_line
+
 
 @dataclass(frozen=True)
 class ScriptNode:
@@ -12,6 +14,7 @@ class ScriptNode:
     text: str
     routes: dict[str, str]
     action: str
+    guardian: bool = False
 
 
 def parse_nodes(raw: list[dict[str, object]] | None) -> list[ScriptNode]:
@@ -36,7 +39,16 @@ def parse_nodes(raw: list[dict[str, object]] | None) -> list[ScriptNode]:
         key = item.get("node_key") or item.get("id") or ""
         node_type = item.get("node_type") or item.get("type") or ""
         if isinstance(key, str) and key and isinstance(node_type, str):
-            parsed.append(ScriptNode(key, node_type, text, routes, action))
+            parsed.append(
+                ScriptNode(
+                    key,
+                    node_type,
+                    text,
+                    routes,
+                    action,
+                    guardian_line(key, node_type, content) is not None,
+                )
+            )
     return parsed
 
 
@@ -51,7 +63,9 @@ def _start(nodes: list[ScriptNode]) -> ScriptNode:
     return nodes[0]
 
 
-def render_script(nodes: list[ScriptNode], *, intent: str) -> tuple[str, str, list[str]]:
+def render_script(
+    nodes: list[ScriptNode], *, intent: str, require_guardian: bool = False
+) -> tuple[str, str, list[str]]:
     """Return spoken text, action, and the mandatory lines that were included."""
     if not nodes:
         return "", "speak", []
@@ -76,6 +90,11 @@ def render_script(nodes: list[ScriptNode], *, intent: str) -> tuple[str, str, li
         else:
             target = current.routes.get(intent) or current.routes.get("next")
         current = by_key.get(target) if target else None
+    if require_guardian:
+        for node in nodes:
+            if node.guardian and node.text and node.text not in spoken:
+                spoken.append(node.text)
+                mandatory.append(node.text)
     if intent in {"refuse", "voicemail"} and action != "transfer":
         action = "hangup"
     return "".join(spoken), action, mandatory

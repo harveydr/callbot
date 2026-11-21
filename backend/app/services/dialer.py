@@ -167,6 +167,8 @@ async def dial_pending(
             phone_hash=contact.phone_hash,
             now=moment,
             flags=flags,
+            minor=contact.minor,
+            template_id=campaign.template_id,
         )
         if not decision.allowed:
             await _blocked(session, campaign, contact, task, decision.code or "", decision.block_reason or "", moment)
@@ -454,6 +456,7 @@ async def _place(
             circuit=asr_circuit,
             tts_circuit=tts_circuit,
             llm_circuit=llm_circuit,
+            require_guardian=contact.minor,
         )
         _store_circuit_alerts(session, campaign.tenant_id, asr_circuit, "asr")
         _store_circuit_alerts(session, campaign.tenant_id, tts_circuit, "tts")

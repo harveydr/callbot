@@ -108,6 +108,7 @@ async def run_session(
     tts_circuit: CircuitPort | None = None,
     llm_circuit: CircuitPort | None = None,
     script: list[dict[str, object]] | None = None,
+    require_guardian: bool = False,
 ) -> Outcome:
     started = time.perf_counter()
     recognizer = asr or MockAsr()
@@ -165,7 +166,9 @@ async def run_session(
         intent = model_intent if isinstance(model_intent, str) and llm_mode == "ok" else classify_intent(heard)
         if llm_mode == "hostile":
             intent = classify_intent(heard)
-    script_body, script_action, mandatory = render_script(parse_nodes(script), intent=intent)
+    script_body, script_action, mandatory = render_script(
+        parse_nodes(script), intent=intent, require_guardian=require_guardian
+    )
     if mandatory:
         action = script_action
         reply = opening + script_body

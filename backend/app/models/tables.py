@@ -98,7 +98,7 @@ class Qualification(Base):
         UniqueConstraint("tenant_id", "doc_type", "file_key"),
         CheckConstraint(
             "doc_type IN ('business_license','telco_value_added_license','callcenter_license',"
-            "'number_certificate','consent_policy','script_filing','other')",
+            "'number_certificate','consent_policy','script_filing','guardian_consent','other')",
             name="doc_type",
         ),
         CheckConstraint("status IN ('pending','approved','rejected','expired')", name="status"),
@@ -237,6 +237,7 @@ class Contact(Base):
     phone_hash: Mapped[str] = mapped_column(Text, nullable=False)
     display_name: Mapped[str | None] = mapped_column(Text)
     dial_class: Mapped[str] = mapped_column(Text, nullable=False)
+    minor: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     reason: Mapped[str | None] = mapped_column(Text)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = _ts()

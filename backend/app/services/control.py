@@ -55,6 +55,7 @@ from app.models.extra import (
 from app.security.crypto import PhoneInvalidError, encrypt_phone, mask_phone, normalize_phone, phone_hash
 from app.security.jwt_codec import REFRESH_TTL, decode, issue
 from app.security.passwords import hash_password, verify_password
+from app.compliance.guardian import minor_marked
 from app.services.billing_budget import apply_billing_budget, month_spend
 from app.services.dialer import dial_pending, ensure_initial_tasks, schedule_retries
 
@@ -458,6 +459,7 @@ async def _parse_import(
                 phone_hash=digest_phone,
                 display_name=(row.get("name") or "").strip() or None,
                 dial_class=dial_class,
+                minor=minor_marked(row.get("minor")),
                 reason=None if dial_class == "dialable" else dial_class,
             )
             session.add(existing)
@@ -465,6 +467,7 @@ async def _parse_import(
         else:
             existing.dial_class = dial_class
             existing.deleted_at = None
+            existing.minor = minor_marked(row.get("minor"))
             existing.reason = None if dial_class == "dialable" else dial_class
         if counts["total"] % 5000 == 0:
             await session.flush()

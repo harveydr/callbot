@@ -443,7 +443,16 @@ async def add_qualification_route(
     session: AsyncSession = Depends(db_session),
 ) -> dict[str, object]:
     del principal
-    allowed = {"business_license", "telco_value_added_license", "callcenter_license", "number_certificate", "consent_policy", "script_filing", "other"}
+    allowed = {
+        "business_license",
+        "telco_value_added_license",
+        "callcenter_license",
+        "number_certificate",
+        "consent_policy",
+        "script_filing",
+        "guardian_consent",
+        "other",
+    }
     if body.doc_type not in allowed:
         raise ApiError(422, "VALIDATION", "doc_type is invalid")
     if body.expires_at is not None and body.expires_at.tzinfo is None:
