@@ -534,15 +534,30 @@ async def start_route(
 
     async def produce() -> tuple[int, dict[str, object]]:
         clock = getattr(request.app.state, "now", None)
+        settings = request.app.state.settings
         data = await start_campaign(
             session,
             campaign=campaign,
-            settings=request.app.state.settings,
+            settings=settings,
             redis=request.app.state.redis,
             user_id=principal.user_id,
             trace_id=request.state.trace_id,
             now=clock() if clock is not None else None,
+            place_calls=not settings.celery_enqueue,
         )
+        if settings.celery_enqueue and not data["idempotent"]:
+            await session.commit()
+            await set_tenant(session, campaign.tenant_id)
+            from app.tasks.dispatch import dispatch_campaign
+
+            try:
+                queued = dispatch_campaign.delay(str(campaign.id), str(campaign.tenant_id))
+            except Exception as exc:
+                campaign.status = "approved"
+                await session.commit()
+                await set_tenant(session, campaign.tenant_id)
+                raise ApiError(503, "UNAVAILABLE", "dispatch queue is unavailable") from exc
+            data["task_id"] = str(queued.id)
         return 202, data
 
     status, data = await finish(session, principal, idempotency_key, "POST", f"/api/t/campaigns/{campaign_id}/start", produce)

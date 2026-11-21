@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -10,12 +11,13 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.config import load_settings
 from app.db import set_bypass, set_tenant
 from app.main import create_app
 from app.models import Call, Campaign, ConsentRecord, Contact, ContactList, DndEntry, ScenarioTemplate, Task, Tenant, Trunk, User
 from app.security.crypto import encrypt_phone, phone_hash
 from app.security.passwords import hash_password
-from app.services.dialer import dial_pending, schedule_retries
+from app.services.dialer import dial_pending, dispatch_campaign_due, schedule_retries
 from app.services.tokens import TokenBucket
 
 NOW = datetime(2026, 11, 22, 2, 0, tzinfo=timezone.utc)
@@ -521,3 +523,163 @@ async def test_opening_is_stored_on_a_completed_call(session_factory: async_sess
         assert recording is not None
         label = recording.aigc_label_meta["AIGC"]
         assert isinstance(label, dict) and label["Label"] == "1"
+
+
+async def test_enqueued_start_returns_before_any_call(
+    session_factory: async_sessionmaker[AsyncSession], redis_client
+) -> None:
+    settings = replace(load_settings(), celery_enqueue=True)
+    code = f"queue-{uuid.uuid4().hex[:8]}"
+    async with session_factory() as session:
+        await set_bypass(session)
+        tenant = Tenant(
+            name="排队",
+            code=code,
+            status="active",
+            allowed_scenarios=["notification"],
+            timezone="Asia/Shanghai",
+            is_demo=False,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(tenant)
+        await session.flush()
+        session.add(
+            User(
+                tenant_id=tenant.id,
+                username=f"op-{code}",
+                password_hash=hash_password(PASSWORD),
+                display_name="op",
+                role="operator",
+                must_change_password=False,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        template = ScenarioTemplate(
+            tenant_id=None,
+            name="n",
+            scenario_code="notification",
+            status="approved",
+            nodes={},
+            version=1,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        contact_list = ContactList(tenant_id=tenant.id, name="名单", scenario_code="notification")
+        trunk = Trunk(
+            tenant_id=tenant.id,
+            name="线路",
+            mode="byoc",
+            provider="byoc",
+            sip_host="sip.example.net",
+            allowed_scenarios=["notification"],
+            status="active",
+        )
+        session.add_all([template, contact_list, trunk])
+        await session.flush()
+        phone = "13800007721"
+        hashed = phone_hash(phone, b"test-pepper-not-for-production")
+        key = __import__("base64").b64decode("AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=")
+        session.add_all(
+            [
+                Contact(
+                    tenant_id=tenant.id,
+                    list_id=contact_list.id,
+                    phone_enc=encrypt_phone(phone, key),
+                    phone_last4=phone[-4:],
+                    phone_hash=hashed,
+                    dial_class="dialable",
+                ),
+                ConsentRecord(
+                    tenant_id=tenant.id,
+                    phone_enc=encrypt_phone(phone, key),
+                    phone_last4=phone[-4:],
+                    phone_hash=hashed,
+                    scenario_code="notification",
+                    source="contract",
+                    consented_at=NOW - timedelta(days=1),
+                ),
+            ]
+        )
+        campaign = Campaign(
+            tenant_id=tenant.id,
+            name="排队外呼",
+            scenario_code="notification",
+            template_id=template.id,
+            template_version=1,
+            list_id=contact_list.id,
+            status="approved",
+            start_at=NOW,
+            end_at=NOW + timedelta(days=1),
+            trunk_id=trunk.id,
+        )
+        session.add(campaign)
+        await session.commit()
+        campaign_id = campaign.id
+        tenant_id = tenant.id
+    application = create_app(settings)
+    application.state.now = lambda: NOW
+    from app.tasks.dispatch import dispatch_campaign
+
+    queued: list[tuple[object, ...]] = []
+    original = dispatch_campaign.delay
+
+    def capture(*args: object) -> object:
+        queued.append(args)
+        return type("Queued", (), {"id": "dispatch-1"})()
+
+    def explode(*_args: object) -> object:
+        raise ConnectionError("broker down")
+
+    dispatch_campaign.delay = explode  # type: ignore[method-assign]
+    try:
+        async with application.router.lifespan_context(application):
+            transport = ASGITransport(app=application)
+            async with AsyncClient(transport=transport, base_url="http://test") as http:
+                logged = await http.post("/api/auth/login", json={"username": f"op-{code}", "password": PASSWORD})
+                token = logged.json()["data"]["access_token"]
+                headers = {"Authorization": f"Bearer {token}", "Idempotency-Key": str(uuid.uuid4())}
+                failed = await http.post(f"/api/t/campaigns/{campaign_id}/start", headers=headers)
+                assert failed.status_code == 503
+                assert failed.json()["code"] == "UNAVAILABLE"
+                dispatch_campaign.delay = capture  # type: ignore[method-assign]
+                started = await http.post(
+                    f"/api/t/campaigns/{campaign_id}/start",
+                    headers={**headers, "Idempotency-Key": str(uuid.uuid4())},
+                )
+                assert started.status_code == 202
+                body = started.json()["data"]
+                assert body["idempotent"] is False
+                assert body["started"] == 0
+                assert body["task_id"] == "dispatch-1"
+                assert queued == [(str(campaign_id), str(tenant_id))]
+                again = await http.post(
+                    f"/api/t/campaigns/{campaign_id}/start",
+                    headers={**headers, "Idempotency-Key": str(uuid.uuid4())},
+                )
+                assert again.status_code == 202
+                assert again.json()["data"]["idempotent"] is True
+                assert queued == [(str(campaign_id), str(tenant_id))]
+    finally:
+        dispatch_campaign.delay = original
+    async with session_factory() as session:
+        await set_bypass(session)
+        stored = await session.get(Campaign, campaign_id)
+        calls = int(await session.scalar(select(func.count()).select_from(Call).where(Call.campaign_id == campaign_id)) or 0)
+        tasks = int(await session.scalar(select(func.count()).select_from(Task).where(Task.campaign_id == campaign_id)) or 0)
+        assert stored is not None and stored.status == "running"
+        assert calls == 0 and tasks == 1
+        tenant = await session.get(Tenant, tenant_id)
+        trunk = await session.scalar(select(Trunk).where(Trunk.tenant_id == tenant_id))
+        assert tenant is not None and trunk is not None
+        placed = await dispatch_campaign_due(
+            session,
+            campaign_id=campaign_id,
+            tenant_id=tenant_id,
+            settings=load_settings(),
+            redis=redis_client,
+            now=NOW,
+        )
+        dialed = int(await session.scalar(select(func.count()).select_from(Call).where(Call.campaign_id == campaign_id)) or 0)
+        assert placed == 1 and dialed == 1

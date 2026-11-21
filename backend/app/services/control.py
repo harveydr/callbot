@@ -506,6 +506,7 @@ async def start_campaign(
     trace_id: str,
     heard: str = "好的",
     now: datetime | None = None,
+    place_calls: bool = True,
 ) -> dict[str, object]:
     if campaign.status not in {"approved", "running"}:
         raise ApiError(409, "CONFLICT", "campaign is not approved")
@@ -522,16 +523,18 @@ async def start_campaign(
     campaign.status = "running"
     campaign.created_by = campaign.created_by or user_id
     created = await ensure_initial_tasks(session, campaign)
-    started = await dial_pending(
-        session,
-        campaign=campaign,
-        tenant=tenant,
-        trunk=trunk,
-        settings=settings,
-        redis=redis,
-        now=moment,
-        heard=heard,
-    )
+    started = 0
+    if place_calls:
+        started = await dial_pending(
+            session,
+            campaign=campaign,
+            tenant=tenant,
+            trunk=trunk,
+            settings=settings,
+            redis=redis,
+            now=moment,
+            heard=heard,
+        )
     total = int(await session.scalar(select(func.count()).select_from(Task).where(Task.campaign_id == campaign.id)) or 0)
     await audit(session, tenant_id=campaign.tenant_id, user_id=user_id, action="campaign.start", target_type="campaign", target_id=str(campaign.id), detail={"created": created, "started": started}, trace_id=trace_id)
     return {"campaign_id": str(campaign.id), "task_count": total, "idempotent": False, "started": started}
