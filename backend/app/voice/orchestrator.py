@@ -69,10 +69,12 @@ async def _asr_text(asr: MockAsr, circuit: VendorCircuit, pcm: bytes) -> tuple[s
     if not circuit.allow_vendor():
         return decode_pcm(pcm), True
     try:
-        return await asr.transcribe(pcm), False
+        text = await asr.transcribe(pcm)
     except VendorRejected as exc:
         circuit.observe(exc.status)
         return decode_pcm(pcm), True
+    circuit.observe_success()
+    return text, False
 
 
 async def run_session(
