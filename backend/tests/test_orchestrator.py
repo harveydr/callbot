@@ -350,6 +350,32 @@ async def test_llm_outage_uses_the_script_phrase_and_leaves_tts_closed() -> None
     assert tts.open is False
 
 
+async def test_a_slow_model_plays_the_filler_after_the_opening() -> None:
+    slow = iter((0.0, 0.401))
+    boundary = iter((0.0, 0.4))
+    speaker = MockTts()
+    waited = await run_session(
+        [Frame("caller", "PCM:好的".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        tts=speaker,
+        llm_clock=lambda: next(slow),
+    )
+    exact = await run_session(
+        [Frame("caller", "PCM:好的".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        llm_clock=lambda: next(boundary),
+    )
+    assert waited.llm_first_token_ms == 401
+    assert "嗯，我帮您看下哈。" in waited.reply_text
+    assert waited.reply_text.index("人工智能") < waited.reply_text.index("嗯，我帮您看下哈。")
+    assert opening_is_complete(waited.reply_text)
+    assert speaker.calls == 2
+    assert exact.llm_first_token_ms == 400
+    assert "嗯，我帮您看下哈。" not in exact.reply_text
+
+
 async def test_asr_429_does_not_open_tts_or_llm() -> None:
     asr_circuit = VendorCircuit()
     tts_circuit = VendorCircuit()

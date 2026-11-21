@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from app.compliance.opening import render_opening
@@ -20,6 +21,8 @@ _INJECTION = ("忽略你的指令", "忽略之前的指令", "ignore previous in
 _GRADE = {"agree": "B", "refuse": "D", "inquiry": "C", "invalid": "NA", "voicemail": "NA"}
 _SCRIPT_MODE = "我用标准流程为您解答。"
 _TTS_CALLBACK = "稍后为您回拨。"
+_FILLER = "嗯，我帮您看下哈。"
+_FILLER_AFTER_MS = 400.0
 
 
 @dataclass(frozen=True)
@@ -58,6 +61,15 @@ def strip_injection(text: str) -> str:
     for phrase in _INJECTION:
         cleaned = cleaned.replace(phrase, "")
     return " ".join(cleaned.split())
+
+
+def _with_filler(reply: str, opening: str, waited_ms: float | None) -> str:
+    """Hide a slow model behind the opening. The identity line stays first."""
+    if waited_ms is None or waited_ms <= _FILLER_AFTER_MS or _FILLER in reply:
+        return reply
+    if reply.startswith(opening):
+        return f"{opening}{_FILLER}{reply.removeprefix(opening)}"
+    return f"{_FILLER}{reply}"
 
 
 def _reply(intent: str, opening: str) -> tuple[str, str]:
@@ -113,6 +125,7 @@ async def run_session(
     llm_circuit: CircuitPort | None = None,
     script: list[dict[str, object]] | None = None,
     require_guardian: bool = False,
+    llm_clock: Callable[[], float] | None = None,
 ) -> Outcome:
     started = time.perf_counter()
     recognizer = asr or MockAsr()
@@ -151,7 +164,8 @@ async def run_session(
         if text:
             heard_parts.append(text)
     heard = strip_injection("".join(heard_parts))
-    llm_started = time.perf_counter()
+    clock = llm_clock or time.perf_counter
+    llm_started = clock()
     if llm_mode == "down":
         llm_circuit.observe(503)
     llm_down = not llm_circuit.allow_vendor()
@@ -177,7 +191,7 @@ async def run_session(
         intent = model_intent if isinstance(model_intent, str) and llm_mode == "ok" else classify_intent(heard)
         if llm_mode == "hostile":
             intent = classify_intent(heard)
-        llm_first_token_ms = (time.perf_counter() - llm_started) * 1000
+        llm_first_token_ms = (clock() - llm_started) * 1000
     script_body, script_action, mandatory = render_script(
         parse_nodes(script), intent=intent, require_guardian=require_guardian
     )
@@ -198,6 +212,14 @@ async def run_session(
             guarded = f"{guarded}{_TTS_CALLBACK}"
     elif guard_action == "hangup":
         action = "hangup"
+    guarded = _with_filler(guarded, opening, None if llm_down else llm_first_token_ms)
+    if not tts_down and _FILLER in guarded:
+        playback.speak(_FILLER)
+        if await _speak(speaker, tts_circuit, _FILLER):
+            tts_down = True
+            action = "hangup"
+            if _TTS_CALLBACK not in guarded:
+                guarded = f"{guarded}{_TTS_CALLBACK}"
     elapsed = (time.perf_counter() - started) * 1000
     channels = {turn["speaker"]: turn["channel"] for turn in playback.turns}
     return Outcome(
