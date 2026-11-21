@@ -1,0 +1,127 @@
+"""EchoDesk API. OpenAPI is disabled unless APP_ENV=dev."""
+
+from __future__ import annotations
+
+import json
+import uuid
+from collections.abc import AsyncIterator
+from typing import Any, cast
+from contextlib import asynccontextmanager
+
+import redis.asyncio as redis_async
+from fastapi import FastAPI, Request, WebSocket
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from app.api import tenant_routes as _tenant_routes  # noqa: F401
+from app.api.surface import auth_router, envelope, platform_router, tenant_router
+from app.config import Settings, load_settings
+from app.services.control import utcnow
+from app.db import make_engine, make_session_factory
+from app.errors import ApiError
+
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "X-Request-ID": "",
+}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    settings: Settings = app.state.settings
+    engine = make_engine(settings.database_url)
+    app.state.engine = engine
+    app.state.sessions = make_session_factory(engine)
+    app.state.redis = cast(Any, redis_async.from_url)(settings.redis_url, decode_responses=True)
+    yield
+    await app.state.redis.aclose()
+    await engine.dispose()
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    resolved = settings or load_settings()
+    docs = "/docs" if resolved.app_env == "dev" else None
+    app = FastAPI(title="EchoDesk", docs_url=docs, redoc_url=None, openapi_url="/openapi.json" if docs else None, lifespan=lifespan)
+    app.state.settings = resolved
+    app.state.now = utcnow
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(resolved.cors_origins),
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE"],
+        allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Tenant-Override"],
+    )
+
+    @app.middleware("http")
+    async def context(request: Request, call_next):  # type: ignore[no-untyped-def]
+        trace_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+        request.state.trace_id = trace_id
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+            raw = await request.body()
+            content_type = request.headers.get("content-type", "")
+            if raw and "application/json" in content_type:
+                try:
+                    parsed = json.loads(raw)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, dict) and "tenant_id" in parsed:
+                    response = JSONResponse(
+                        status_code=400,
+                        content=envelope(trace_id, {}, code="BAD_REQUEST", message="tenant_id is not accepted"),
+                    )
+                    response.headers["X-Request-ID"] = trace_id
+                    return response
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = trace_id
+        for key, value in _SECURITY_HEADERS.items():
+            if key == "X-Request-ID":
+                continue
+            response.headers.setdefault(key, value)
+        return response
+
+    @app.exception_handler(ApiError)
+    async def api_error(_request: Request, exc: ApiError) -> JSONResponse:
+        trace_id = getattr(_request.state, "trace_id", "")
+        return JSONResponse(status_code=exc.status, content=envelope(trace_id, exc.data, code=exc.code, message=exc.message))
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(_request: Request, _exc: RequestValidationError) -> JSONResponse:
+        trace_id = getattr(_request.state, "trace_id", "")
+        return JSONResponse(status_code=422, content=envelope(trace_id, {}, code="VALIDATION", message="request validation failed"))
+
+    @app.exception_handler(Exception)
+    async def unhandled(_request: Request, exc: Exception) -> JSONResponse:
+        trace_id = getattr(_request.state, "trace_id", "")
+        message = "internal error" if resolved.app_env != "dev" else str(exc)
+        return JSONResponse(status_code=500, content=envelope(trace_id, {}, code="INTERNAL", message=message))
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.websocket("/api/t/live/ws")
+    async def live_socket(websocket: WebSocket) -> None:
+        ticket = websocket.query_params.get("ticket", "")
+        owner = await app.state.redis.get(f"ws:{ticket}") if ticket else None
+        if not owner:
+            await websocket.close(code=4401)
+            return
+        await websocket.accept()
+        await websocket.send_json({"type": "ready"})
+        try:
+            while True:
+                message = await websocket.receive_text()
+                await websocket.send_json({"type": "ack", "length": len(message)})
+        except Exception:
+            return
+
+    app.include_router(auth_router, prefix="/api")
+    app.include_router(platform_router, prefix="/api/p")
+    app.include_router(tenant_router, prefix="/api/t")
+    return app
+
+
+app = create_app()
