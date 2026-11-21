@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from app.compliance.guardian import guardian_line
+
+_SCOPE_LINE = "这个问题不在本次说明范围内，我让同事回电给您。"
+_CLAIM = re.compile(r"\d+(?:\.\d+)?\s*元|价格|费用|收费|合同|条款|保修|退款|自动续费")
 
 
 @dataclass(frozen=True)
@@ -15,6 +19,7 @@ class ScriptNode:
     routes: dict[str, str]
     action: str
     guardian: bool = False
+    knowledge: str = ""
 
 
 def parse_nodes(raw: list[dict[str, object]] | None) -> list[ScriptNode]:
@@ -36,6 +41,13 @@ def parse_nodes(raw: list[dict[str, object]] | None) -> list[ScriptNode]:
             routes.setdefault("next", nxt)
         raw_action = content.get("action")
         action = raw_action if isinstance(raw_action, str) else ""
+        raw_knowledge = content.get("knowledge")
+        if isinstance(raw_knowledge, str):
+            knowledge = raw_knowledge
+        elif isinstance(raw_knowledge, list):
+            knowledge = "".join(item for item in raw_knowledge if isinstance(item, str))
+        else:
+            knowledge = ""
         key = item.get("node_key") or item.get("id") or ""
         node_type = item.get("node_type") or item.get("type") or ""
         if isinstance(key, str) and key and isinstance(node_type, str):
@@ -47,6 +59,7 @@ def parse_nodes(raw: list[dict[str, object]] | None) -> list[ScriptNode]:
                     routes,
                     action,
                     guardian_line(key, node_type, content) is not None,
+                    knowledge,
                 )
             )
     return parsed
@@ -98,3 +111,39 @@ def render_script(
     if intent in {"refuse", "voicemail"} and action != "transfer":
         action = "hangup"
     return "".join(spoken), action, mandatory
+
+
+def active_knowledge(nodes: list[ScriptNode], *, intent: str) -> str | None:
+    """Facts the visited free node may use. None when the path has no free node."""
+    if not nodes:
+        return None
+    by_key = {node.key: node for node in nodes}
+    current: ScriptNode | None = _start(nodes)
+    seen: set[str] = set()
+    found: str | None = None
+    while current is not None and current.key not in seen:
+        seen.add(current.key)
+        if current.node_type == "llm_free" and found is None:
+            found = current.knowledge
+        if current.action == "transfer" or current.node_type == "transfer":
+            break
+        if current.node_type == "gate":
+            target = current.routes.get(intent) or current.routes.get("invalid") or current.routes.get("next")
+        else:
+            target = current.routes.get(intent) or current.routes.get("next")
+        current = by_key.get(target) if target else None
+    return found
+
+
+def confine_to_knowledge(reply: str, opening: str, knowledge: str | None, mandatory: list[str]) -> str:
+    """Drop a free answer that states a price or contract term missing from the node."""
+    if knowledge is None:
+        return reply
+    checked = reply.removeprefix(opening) if reply.startswith(opening) else reply
+    for line in mandatory:
+        checked = checked.replace(line, "")
+    for claim in _CLAIM.findall(checked):
+        if claim not in knowledge:
+            kept = opening + "".join(line for line in mandatory if line)
+            return f"{kept}{_SCOPE_LINE}"
+    return reply

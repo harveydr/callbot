@@ -350,6 +350,45 @@ async def test_llm_outage_uses_the_script_phrase_and_leaves_tts_closed() -> None
     assert tts.open is False
 
 
+def _priced_script(knowledge: str) -> list[dict[str, object]]:
+    return [
+        {
+            "node_key": "n_open",
+            "node_type": "mandatory",
+            "content": {"text": "必须播报的开场要点。", "next": "n_ask"},
+        },
+        {
+            "node_key": "n_ask",
+            "node_type": "llm_free",
+            "content": {"knowledge_scope": "product_faq", "knowledge": knowledge},
+        },
+    ]
+
+
+async def test_a_free_answer_cannot_leave_the_node_knowledge() -> None:
+    refused = await run_session(
+        [Frame("caller", "PCM:请问一下".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        llm_mode="priced",
+        script=_priced_script("本次只通知时间。"),
+    )
+    allowed = await run_session(
+        [Frame("caller", "PCM:请问一下".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        llm_mode="priced",
+        script=_priced_script("费用是 99 元，合同自动续费。"),
+    )
+    assert "99 元" not in refused.reply_text
+    assert "合同" not in refused.reply_text
+    assert "不在本次说明范围内" in refused.reply_text
+    assert "必须播报的开场要点。" in refused.reply_text
+    assert opening_is_complete(refused.reply_text)
+    assert "费用是 99 元，合同自动续费。" in allowed.reply_text
+    assert "不在本次说明范围内" not in allowed.reply_text
+
+
 async def test_silence_clarifies_once_and_then_says_goodbye() -> None:
     script = [
         {

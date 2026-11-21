@@ -12,7 +12,7 @@ from app.compliance.redline import guard_assistant_text
 from app.voice.asr import MockAsr, VendorRejected, decode_pcm
 from app.voice.circuit import CircuitPort, VendorCircuit
 from app.voice.intent import classify_intent
-from app.voice.script import parse_nodes, render_script
+from app.voice.script import active_knowledge, confine_to_knowledge, parse_nodes, render_script
 from app.voice.session import Playback
 from app.voice.tts import MockTts
 from app.voice.vad import EnergyVad
@@ -190,6 +190,7 @@ async def run_session(
         llm_circuit.observe(503)
     llm_down = False if no_input else not llm_circuit.allow_vendor()
     llm_first_token_ms: float | None = None
+    model_say = ""
     if no_input:
         intent = "invalid"
     elif llm_down:
@@ -201,6 +202,8 @@ async def run_session(
             degraded = True
         elif llm_mode == "hostile":
             raw = json.dumps({"intent": "agree", "say": "我们保证收益", "skip_compliance": True}, ensure_ascii=False)
+        elif llm_mode == "priced":
+            raw = json.dumps({"intent": "inquiry", "say": "费用是 99 元，合同自动续费。"}, ensure_ascii=False)
         else:
             raw = json.dumps({"intent": classify_intent(heard)}, ensure_ascii=False)
             llm_circuit.observe_success()
@@ -213,6 +216,8 @@ async def run_session(
         intent = model_intent if isinstance(model_intent, str) and llm_mode == "ok" else classify_intent(heard)
         if llm_mode == "hostile":
             intent = classify_intent(heard)
+        if llm_mode == "priced" and isinstance(parsed, dict) and isinstance(parsed.get("say"), str):
+            model_say = parsed["say"]
         llm_first_token_ms = (clock() - llm_started) * 1000
     script_body, script_action, mandatory = render_script(
         parse_nodes(script), intent=intent, require_guardian=require_guardian
@@ -230,6 +235,11 @@ async def run_session(
     elif no_input and _CLARIFY not in reply:
         action = "speak"
         reply = f"{reply}{_CLARIFY}"
+    nodes = parse_nodes(script)
+    knowledge = active_knowledge(nodes, intent=intent)
+    if model_say and knowledge is not None:
+        reply = f"{reply}{model_say}"
+    reply = confine_to_knowledge(reply, opening, knowledge, mandatory)
     guarded, hits, guard_action = guard_assistant_text(reply, prior_hits=0)
     for line in mandatory:
         if line not in guarded:
