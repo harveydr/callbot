@@ -1,0 +1,68 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend:
+    # ubuntu-latest is 26.04 and does not publish CPython 3.11.9. 24.04 still does.
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16.4
+        env:
+          POSTGRES_USER: echodesk
+          POSTGRES_PASSWORD: echodesk
+          POSTGRES_DB: echodesk
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U echodesk"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7.2.5
+        ports: ["6379:6379"]
+    env:
+      PGPASSWORD: echodesk
+      SUPER_DATABASE_URL: postgresql+asyncpg://echodesk:echodesk@127.0.0.1:5432/echodesk_test
+      DATABASE_URL: postgresql+asyncpg://echodesk_app:echodesk@127.0.0.1:5432/echodesk_test
+      REDIS_URL: redis://127.0.0.1:6379/15
+      TEST_REDIS_URL: redis://127.0.0.1:6379/15
+      JWT_SECRET: ci-jwt-secret-not-for-production
+      PHONE_PEPPER: ci-pepper-not-for-production
+      FIELD_ENC_KEY: AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=
+      CALLING_ENABLED: "true"
+      FEATURE_TELESALES: "false"
+      FEATURE_COLLECTION: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.9"
+      - run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - run: pip install -r backend/requirements-dev.txt
+      - run: ruff check app tests alembic
+        working-directory: backend
+      - run: mypy app
+        working-directory: backend
+      - run: pytest -q
+        working-directory: backend
+      - run: python scripts/eval_redline.py
+      - run: python scripts/eval_intent.py
+      - run: python scripts/go_live_check.py
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+        working-directory: frontend
+      - run: npm run lint
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend

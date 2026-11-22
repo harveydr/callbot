@@ -1,0 +1,18 @@
+name: deploy
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: release order
+        run: |
+          echo "1. alembic upgrade head"
+          echo "2. set CALLING_ENABLED=false and wait for active calls to drain before voice changes"
+          echo "3. roll api and worker"
+          echo "4. healthcheck /health"
+          echo "5. restore CALLING_ENABLED"
+          echo "A failed release rolls the image tag back and runs alembic downgrade -1"

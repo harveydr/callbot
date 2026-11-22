@@ -1,0 +1,749 @@
+"""Campaign dispatch. Compliance runs again immediately before each dial."""
+
+from __future__ import annotations
+
+import uuid
+from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
+from typing import cast
+
+import redis.asyncio as redis_async
+from sqlalchemy import or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.compliance.cache import load_template_script, remember_dnd
+from app.llm.prompt import FIRST_SAMPLE
+from app.compliance.gate_pre import CampaignView, Flags, TenantView, TrunkView, pre_dial_gate
+from app.compliance.qualification import apply_qualification_clock
+from app.compliance.guard_incall import on_caller_text
+from app.compliance.qc_post import block_followups, mark_recording_missing, review_call, wants_reschedule
+from app.config import Settings
+from app.models import Call, CallEvent, CallerNumber, Campaign, Contact, Task, Tenant, Trunk, User
+from app.models.extra import (
+    Alert,
+    BillingItem,
+    BillingRate,
+    CallTransfer,
+    CallTurn,
+    QcResult,
+    Recording,
+    Transcript,
+)
+from app.services.billing_budget import apply_billing_budget
+from app.services.call_state import move_call, reach
+from app.services.number_health import refresh_caller_health
+from app.services.ops_alerts import record_voice
+from app.services.tokens import TokenBucket
+from app.voice.circuit import CircuitPort, SharedVendorCircuit
+from app.voice.orchestrator import caller_frames, run_session
+from app.voice.stereo import EXPLICIT_LABEL, label_meta, write_recording
+
+EXPLICIT_AIGC = EXPLICIT_LABEL
+_RETRYABLE = ("no_answer", "busy")
+_REJECTED_HEARD = frozenset({"拒接", "用户拒接"})
+_TOKEN_TTL_SEC = 7200
+_NO_AGENT_LINE = "现在没有同事在线，我为您登记三十分钟内回拨。"
+
+
+def concurrency_layers(tenant: Tenant, trunk: Trunk, campaign: Campaign) -> list[tuple[str, int]]:
+    """Live caps named by the PRD: tenant and trunk, plus the campaign's own cap."""
+    return [
+        (f"tenant:{tenant.id}:conc", tenant.max_concurrency),
+        (f"trunk:{trunk.id}:conc", trunk.max_concurrency),
+        (f"campaign:{campaign.id}:conc", campaign.max_concurrency),
+    ]
+
+
+def _retry_delay(policy: dict[str, object], existing_attempts: int) -> timedelta:
+    """Minutes from retry_policy.interval_min. The first retry uses the first entry."""
+    raw = policy.get("interval_min")
+    minutes = 60
+    if isinstance(raw, list) and raw:
+        index = min(max(existing_attempts - 1, 0), len(raw) - 1)
+        chosen = raw[index]
+        if isinstance(chosen, int) and not isinstance(chosen, bool):
+            minutes = chosen
+        elif isinstance(chosen, str) and chosen.isdigit():
+            minutes = int(chosen)
+    if minutes < 0:
+        minutes = 0
+    return timedelta(minutes=minutes)
+_REJECT_SAMPLE = 5
+_REJECT_RATE = 0.85
+
+
+def _store_circuit_alerts(session: AsyncSession, tenant_id: uuid.UUID, circuit: CircuitPort, vendor: str) -> None:
+    for code, reason in circuit.drain_alerts():
+        session.add(
+            Alert(
+                tenant_id=tenant_id,
+                severity="warning",
+                code=code,
+                message=f"{vendor} 供应商熔断 {reason}",
+            )
+        )
+
+
+def _aware(now: datetime) -> datetime:
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware UTC")
+    return now.astimezone(timezone.utc)
+
+
+async def ensure_initial_tasks(session: AsyncSession, campaign: Campaign, *, now: datetime | None = None) -> int:
+    contacts = (
+        await session.scalars(
+            select(Contact).where(
+                Contact.list_id == campaign.list_id,
+                Contact.tenant_id == campaign.tenant_id,
+                Contact.deleted_at.is_(None),
+            )
+        )
+    ).all()
+    moment = _aware(now if now is not None else datetime.now(timezone.utc))
+    created = 0
+    for contact in contacts:
+        exists = await session.scalar(
+            select(Task.id).where(Task.campaign_id == campaign.id, Task.contact_id == contact.id, Task.attempt_no == 1)
+        )
+        if exists is not None:
+            continue
+        session.add(
+            Task(
+                tenant_id=campaign.tenant_id,
+                campaign_id=campaign.id,
+                contact_id=contact.id,
+                attempt_no=1,
+                status="pending",
+                next_run_at=moment,
+            )
+        )
+        created += 1
+    await session.flush()
+    return created
+
+
+async def dial_pending(
+    session: AsyncSession,
+    *,
+    campaign: Campaign,
+    tenant: Tenant,
+    trunk: Trunk,
+    settings: Settings,
+    redis: redis_async.Redis,
+    now: datetime,
+    heard: str = "好的",
+    llm_mode: str = "ok",
+    guard_judge: Callable[[str], list[str]] | None = None,
+    guard_clock: Callable[[], float] | None = None,
+    prior_silence: int = 0,
+) -> int:
+    """Dial pending tasks up to the live concurrency limit. Returns calls created."""
+    if campaign.status != "running":
+        return 0
+    moment = _aware(now)
+    await apply_qualification_clock(session, tenant, moment)
+    bucket = TokenBucket(redis, prefix="")
+    flags = Flags(settings.calling_enabled, settings.feature_telesales, settings.feature_collection)
+    layers = concurrency_layers(tenant, trunk, campaign)
+    names = [name for name, _limit in layers]
+    limit = min(cap for _name, cap in layers)
+    started = 0
+    while started < limit and campaign.status == "running":
+        if await apply_billing_budget(session, tenant, moment):
+            break
+        if not await bucket.acquire_all(layers, ttl_sec=_TOKEN_TTL_SEC):
+            break
+        try:
+            task = await _claim_task(session, campaign, moment)
+            if task is None:
+                break
+            contact = await session.scalar(select(Contact).where(Contact.id == task.contact_id))
+            if contact is None or contact.deleted_at is not None:
+                task.status = "skipped"
+                continue
+            decision = await pre_dial_gate(
+                session,
+                tenant=TenantView(
+                    tenant.id,
+                    tenant.status,
+                    list(tenant.allowed_scenarios),
+                    tenant.timezone,
+                    tenant.daily_call_quota,
+                ),
+                trunk=TrunkView(trunk.mode, trunk.status, list(trunk.allowed_scenarios)),
+                campaign=CampaignView(
+                    campaign.scenario_code,
+                    campaign.call_window,
+                    campaign.timezone,
+                    campaign.freq_per_phone_daily,
+                    campaign.freq_per_phone_7d,
+                    campaign.freq_per_phone_30d,
+                ),
+                phone_hash=contact.phone_hash,
+                now=moment,
+                flags=flags,
+                minor=contact.minor,
+                template_id=campaign.template_id,
+                redis=redis,
+            )
+            if not decision.allowed:
+                await _blocked(session, campaign, contact, task, decision.code or "", decision.block_reason or "", moment)
+                continue
+            caller = await _active_caller(session, campaign)
+            if campaign.caller_number_id is not None and caller is None:
+                await _blocked(session, campaign, contact, task, "COMPLIANCE_SCENARIO_NOT_ALLOWED", "caller_blocked", moment)
+                continue
+            try:
+                await _place(
+                    session,
+                    campaign,
+                    tenant,
+                    contact,
+                    task,
+                    settings,
+                    redis,
+                    moment,
+                    heard,
+                    caller,
+                    llm_mode,
+                    guard_judge,
+                    guard_clock,
+                    prior_silence,
+                )
+            except Exception:
+                task.status = "failed"
+                raise
+            started += 1
+        finally:
+            await bucket.release_all(names)
+    await _pause_if_rejected(session, campaign, moment)
+    return started
+
+
+async def _claim_task(session: AsyncSession, campaign: Campaign, moment: datetime) -> Task | None:
+    """Lock one due task. Another worker's locked row is skipped, not double-dialed."""
+    return cast(
+        Task | None,
+        await session.scalar(
+            select(Task)
+            .where(
+                Task.campaign_id == campaign.id,
+                Task.status == "pending",
+                or_(Task.next_run_at.is_(None), Task.next_run_at <= moment),
+            )
+            .order_by(Task.created_at, Task.attempt_no)
+            .limit(1)
+            .with_for_update(skip_locked=True)
+        ),
+    )
+
+
+async def schedule_retries(session: AsyncSession, campaign: Campaign, now: datetime) -> int:
+    if campaign.status != "running":
+        return 0
+    moment = _aware(now)
+    tenant = await session.scalar(select(Tenant).where(Tenant.id == campaign.tenant_id))
+    if tenant is not None and await apply_billing_budget(session, tenant, moment):
+        return 0
+    raw_max = campaign.retry_policy.get("max_retry", 0)
+    max_retry = raw_max if isinstance(raw_max, int) else int(str(raw_max))
+    calls = (
+        await session.scalars(select(Call).where(Call.campaign_id == campaign.id, Call.status.in_(_RETRYABLE)))
+    ).all()
+    created = 0
+    for call in calls:
+        attempts = (
+            await session.scalars(select(Task).where(Task.campaign_id == campaign.id, Task.contact_id == call.contact_id))
+        ).all()
+        if any(item.status == "pending" for item in attempts):
+            continue
+        if len(attempts) >= 1 + max_retry:
+            continue
+        session.add(
+            Task(
+                tenant_id=campaign.tenant_id,
+                campaign_id=campaign.id,
+                contact_id=call.contact_id,
+                attempt_no=len(attempts) + 1,
+                status="pending",
+                next_run_at=moment + _retry_delay(campaign.retry_policy, len(attempts)),
+            )
+        )
+        created += 1
+    await session.flush()
+    return created
+
+
+async def dispatch_campaign_due(
+    session: AsyncSession,
+    *,
+    campaign_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    settings: Settings,
+    redis: redis_async.Redis,
+    now: datetime,
+    heard: str = "好的",
+) -> int:
+    """Create interval retries, then dial tasks whose next_run_at has arrived."""
+    campaign = await session.scalar(
+        select(Campaign).where(Campaign.id == campaign_id, Campaign.tenant_id == tenant_id)
+    )
+    if campaign is None or campaign.status != "running":
+        return 0
+    tenant = await session.scalar(select(Tenant).where(Tenant.id == tenant_id))
+    trunk = await session.scalar(select(Trunk).where(Trunk.id == campaign.trunk_id))
+    if tenant is None or trunk is None:
+        return 0
+    moment = _aware(now)
+    await schedule_retries(session, campaign, moment)
+    return await dial_pending(
+        session,
+        campaign=campaign,
+        tenant=tenant,
+        trunk=trunk,
+        settings=settings,
+        redis=redis,
+        now=moment,
+        heard=heard,
+    )
+
+
+async def dispatch_due(
+    session: AsyncSession,
+    *,
+    settings: Settings,
+    redis: redis_async.Redis,
+    now: datetime,
+    heard: str = "好的",
+) -> int:
+    """Walk running campaigns. Paused, aborted, and not-yet-due tasks stay put."""
+    moment = _aware(now)
+    campaigns = (await session.scalars(select(Campaign).where(Campaign.status == "running"))).all()
+    started = 0
+    for campaign in campaigns:
+        started += await dispatch_campaign_due(
+            session,
+            campaign_id=campaign.id,
+            tenant_id=campaign.tenant_id,
+            settings=settings,
+            redis=redis,
+            now=moment,
+            heard=heard,
+        )
+    return started
+
+
+async def _handoff(
+    session: AsyncSession,
+    campaign: Campaign,
+    contact: Contact,
+    task: Task,
+    call: Call,
+    now: datetime,
+) -> str | None:
+    """Park a waiting agent, or return to the call, promise a callback, and finish."""
+    agent = await session.scalar(
+        select(User)
+        .where(User.tenant_id == campaign.tenant_id, User.role == "agent", User.status == "active")
+        .limit(1)
+    )
+    if agent is not None:
+        session.add(CallTransfer(tenant_id=campaign.tenant_id, call_id=call.id, agent_id=agent.id, status="pending"))
+        return None
+    move_call(call, "transfer_failed")
+    session.add(
+        CallEvent(
+            tenant_id=campaign.tenant_id,
+            call_id=call.id,
+            event_type="transfer",
+            detail={"status": "failed", "no_agent_action": "callback_30min", "returned_to": "talking"},
+        )
+    )
+    await _callback(session, campaign, contact, task, call, now, timedelta(minutes=30))
+    move_call(call, "talking")
+    if call.answer_at is None:
+        call.answer_at = now
+    call.duration_sec = 30
+    call.ai_duration_sec = 30
+    call.human_duration_sec = 0
+    move_call(call, "completed")
+    return _NO_AGENT_LINE
+
+
+async def _callback(
+    session: AsyncSession,
+    campaign: Campaign,
+    contact: Contact,
+    task: Task,
+    call: Call,
+    now: datetime,
+    delay: timedelta,
+) -> None:
+    attempt_no = task.attempt_no + 1
+    exists = await session.scalar(
+        select(Task.id).where(
+            Task.campaign_id == campaign.id, Task.contact_id == contact.id, Task.attempt_no == attempt_no
+        )
+    )
+    if exists is None:
+        session.add(
+            Task(
+                tenant_id=campaign.tenant_id,
+                campaign_id=campaign.id,
+                contact_id=contact.id,
+                attempt_no=attempt_no,
+                status="pending",
+                next_run_at=now + delay,
+            )
+        )
+    session.add(
+        CallEvent(
+            tenant_id=campaign.tenant_id,
+            call_id=call.id,
+            event_type="callback",
+            detail={"next_run_at": (now + delay).isoformat()},
+        )
+    )
+
+
+async def _touch_health(session: AsyncSession, caller: CallerNumber, now: datetime) -> None:
+    await refresh_caller_health(session, caller, now)
+
+
+async def _blocked(
+    session: AsyncSession,
+    campaign: Campaign,
+    contact: Contact,
+    task: Task,
+    code: str,
+    reason: str,
+    now: datetime,
+) -> None:
+    task.status = "blocked"
+    call = Call(
+        tenant_id=campaign.tenant_id,
+        campaign_id=campaign.id,
+        contact_id=contact.id,
+        call_uuid=uuid.uuid4(),
+        status="queued",
+        block_reason=reason,
+        trunk_id=campaign.trunk_id,
+        template_version=campaign.template_version,
+        start_at=now,
+        end_at=now,
+        duration_sec=0,
+        compliance_hit=[{"code": code, "reason": reason}],
+        created_by=campaign.created_by,
+    )
+    reach(call, "blocked_compliance")
+    session.add(call)
+    await session.flush()
+    session.add(
+        CallEvent(
+            tenant_id=campaign.tenant_id,
+            call_id=call.id,
+            event_type="gate_block",
+            detail={"code": code, "block_reason": reason},
+        )
+    )
+
+
+async def _active_caller(session: AsyncSession, campaign: Campaign) -> CallerNumber | None:
+    if campaign.caller_number_id is not None:
+        row = cast(CallerNumber | None, await session.get(CallerNumber, campaign.caller_number_id))
+        if row is None or row.tenant_id != campaign.tenant_id or row.status != "active":
+            return None
+        return row
+    found: CallerNumber | None = await session.scalar(
+        select(CallerNumber)
+        .where(
+            CallerNumber.tenant_id == campaign.tenant_id,
+            CallerNumber.trunk_id == campaign.trunk_id,
+            CallerNumber.status == "active",
+        )
+        .limit(1)
+    )
+    return found
+
+
+async def _pause_if_rejected(session: AsyncSession, campaign: Campaign, now: datetime) -> None:
+    since = now - timedelta(minutes=5)
+    statuses = (
+        await session.scalars(
+            select(Call.status).where(Call.campaign_id == campaign.id, Call.start_at.is_not(None), Call.start_at >= since)
+        )
+    ).all()
+    if len(statuses) < _REJECT_SAMPLE:
+        return
+    rejected = sum(1 for status in statuses if status == "rejected")
+    if rejected / len(statuses) > _REJECT_RATE:
+        campaign.status = "paused"
+
+
+async def _place(
+    session: AsyncSession,
+    campaign: Campaign,
+    tenant: Tenant,
+    contact: Contact,
+    task: Task,
+    settings: Settings,
+    redis: redis_async.Redis,
+    now: datetime,
+    heard: str,
+    caller: CallerNumber | None,
+    llm_mode: str = "ok",
+    guard_judge: Callable[[str], list[str]] | None = None,
+    guard_clock: Callable[[], float] | None = None,
+    prior_silence: int = 0,
+) -> None:
+    script = await load_template_script(session, redis, campaign.template_id)
+    frames = caller_frames(heard, script)
+    asr_circuit = SharedVendorCircuit(settings.redis_url, "asr")
+    tts_circuit = SharedVendorCircuit(settings.redis_url, "tts")
+    llm_circuit = SharedVendorCircuit(settings.redis_url, "llm")
+    try:
+        outcome = await run_session(
+            frames,
+            company=tenant.name,
+            purpose=campaign.name,
+            script=script,
+            circuit=asr_circuit,
+            tts_circuit=tts_circuit,
+            llm_circuit=llm_circuit,
+            require_guardian=contact.minor,
+            llm_mode=llm_mode,
+            guard_judge=guard_judge,
+            guard_clock=guard_clock,
+            prior_silence=prior_silence,
+        )
+        await record_voice(
+            redis,
+            asr_attempts=outcome.asr_attempts,
+            asr_errors=outcome.asr_errors,
+            llm_first_token_ms=outcome.llm_first_token_ms,
+            now=now,
+        )
+        _store_circuit_alerts(session, campaign.tenant_id, asr_circuit, "asr")
+        _store_circuit_alerts(session, campaign.tenant_id, tts_circuit, "tts")
+        _store_circuit_alerts(session, campaign.tenant_id, llm_circuit, "llm")
+    finally:
+        asr_circuit.close()
+        tts_circuit.close()
+        llm_circuit.close()
+    if heard in _REJECTED_HEARD:
+        status = "rejected"
+    elif heard == "无人接听" or outcome.voicemail:
+        status = "no_answer"
+    elif outcome.action == "transfer":
+        status = "transferring"
+    else:
+        status = "completed"
+    call_uuid = uuid.uuid4()
+    call = Call(
+        tenant_id=campaign.tenant_id,
+        campaign_id=campaign.id,
+        contact_id=contact.id,
+        call_uuid=call_uuid,
+        status="queued",
+        caller_number=None if caller is None else caller.number,
+        trunk_id=campaign.trunk_id,
+        template_version=campaign.template_version,
+        start_at=now,
+        answer_at=now if status == "completed" else None,
+        end_at=now,
+        duration_sec=0 if status != "completed" else 30,
+        ai_duration_sec=0 if status != "completed" else 30,
+        human_duration_sec=0,
+        turn_count=len(outcome.turns),
+        barge_in_count=1 if outcome.barged_in else 0,
+        latency_p50_ms=round(outcome.latency_ms),
+        latency_p95_ms=round(outcome.latency_ms),
+        intent_grade=outcome.intent_grade,
+        compliance_hit=[
+            *[{"rule": code} for code in outcome.redline_hits],
+            *([{"rule": "forced_ai_notice"}] if outcome.opening_forced else []),
+        ],
+        created_by=campaign.created_by,
+    )
+    reach(call, status)
+    session.add(call)
+    await session.flush()
+    if outcome.tts_down:
+        campaign.status = "paused"
+    notice: str | None = None
+    if status == "transferring":
+        notice = await _handoff(session, campaign, contact, task, call, now)
+    elif outcome.tts_down and not outcome.needs_dnd and not outcome.voicemail and heard not in _REJECTED_HEARD:
+        await _callback(session, campaign, contact, task, call, now, timedelta(minutes=30))
+    elif status == "completed" and wants_reschedule(heard):
+        await _callback(session, campaign, contact, task, call, now, timedelta(days=1))
+    if notice:
+        outcome.reply_text = f"{outcome.reply_text}{notice}"
+    if caller is not None:
+        await _touch_health(session, caller, now)
+    if outcome.needs_dnd:
+        in_call = await on_caller_text(
+            session,
+            tenant_id=campaign.tenant_id,
+            call_id=call.id,
+            phone_hash=contact.phone_hash,
+            phone_last4=contact.phone_last4,
+            text=heard,
+            company=tenant.name,
+            purpose=campaign.name,
+            opening_played=True,
+            model_demand_stop=outcome.demand_stop,
+        )
+        if in_call.dnd_written:
+            await remember_dnd(redis, tenant_id=campaign.tenant_id, phone_hash=contact.phone_hash)
+    task.status = "done"
+    session.add(
+        CallTurn(
+            tenant_id=campaign.tenant_id,
+            call_id=call.id,
+            turn_idx=0,
+            speaker="assistant",
+            text_content=outcome.reply_text,
+        )
+    )
+    if outcome.heard:
+        session.add(
+            CallTurn(
+                tenant_id=campaign.tenant_id,
+                call_id=call.id,
+                turn_idx=1,
+                speaker="caller",
+                text_content=outcome.heard,
+            )
+        )
+    meta = label_meta(call_uuid, settings.aigc_producer_code)
+    try:
+        object_key = write_recording(tenant.id, call_uuid, outcome.turns, meta)
+    except OSError:
+        object_key = None
+    if object_key is not None:
+        session.add(
+            Recording(
+                tenant_id=campaign.tenant_id,
+                call_id=call.id,
+                object_key=object_key,
+                aigc_label_meta=meta,
+                explicit_label=EXPLICIT_AIGC,
+                created_by=campaign.created_by,
+                retain_until=now + timedelta(days=180),
+            )
+        )
+    turns: list[dict[str, str]] = [{"speaker": "assistant", "text": outcome.reply_text}]
+    if outcome.heard:
+        turns.append({"speaker": "caller", "text": outcome.heard})
+    review = review_call(
+        assistant=outcome.reply_text,
+        caller=outcome.heard,
+        grade=outcome.intent_grade,
+        redline_hits=outcome.redline_hits,
+        transcript_present=True,
+    )
+    if object_key is None:
+        review = mark_recording_missing(review)
+        session.add(
+            Alert(
+                tenant_id=campaign.tenant_id,
+                severity="critical",
+                code="recording_missing",
+                message=f"通话 {call_uuid} 已生成但录音未落盘",
+            )
+        )
+        session.add(
+            CallEvent(
+                tenant_id=campaign.tenant_id,
+                call_id=call.id,
+                event_type="recording_missing",
+                detail={"call_uuid": str(call_uuid)},
+            )
+        )
+    session.add(
+        Transcript(
+            tenant_id=campaign.tenant_id,
+            call_id=call.id,
+            body={"explicit_label": EXPLICIT_AIGC, "turns": turns},
+            summary=review.summary,
+            created_by=campaign.created_by,
+        )
+    )
+    call.summary = review.summary
+    session.add(
+        QcResult(
+            tenant_id=campaign.tenant_id,
+            call_id=call.id,
+            result=review.result,
+            detail=review.detail,
+        )
+    )
+    if review.block_script:
+        await block_followups(session, campaign)
+    session.add(
+        CallEvent(
+            tenant_id=campaign.tenant_id,
+            call_id=call.id,
+            event_type="ai_notice",
+            detail={"played": True, "forced": outcome.opening_forced},
+        )
+    )
+    if outcome.opening_forced:
+        session.add(
+            CallEvent(
+                tenant_id=campaign.tenant_id,
+                call_id=call.id,
+                event_type="ai_notice_forced",
+                detail={"opening_complete": True},
+            )
+        )
+    if outcome.guard_timeout:
+        session.add(
+            CallEvent(
+                tenant_id=campaign.tenant_id,
+                call_id=call.id,
+                event_type="guard_timeout",
+                detail={"timeout_ms": 30},
+            )
+        )
+    if outcome.script_tree:
+        session.add(
+            CallEvent(
+                tenant_id=campaign.tenant_id,
+                call_id=call.id,
+                event_type="script_tree",
+                detail={"mode": "script_tree"},
+            )
+        )
+    if outcome.llm_format_error:
+        session.add(
+            CallEvent(
+                tenant_id=campaign.tenant_id,
+                call_id=call.id,
+                event_type="llm_format_error",
+                detail={
+                    "retried": True,
+                    "temperatures": outcome.llm_temperatures,
+                    "top_p": FIRST_SAMPLE.top_p,
+                    "max_tokens": FIRST_SAMPLE.max_tokens,
+                },
+            )
+        )
+    rate = await session.scalar(
+        select(BillingRate)
+        .where((BillingRate.tenant_id == tenant.id) | (BillingRate.tenant_id.is_(None)))
+        .order_by(BillingRate.tenant_id.is_(None))
+        .limit(1)
+    )
+    session.add(
+        BillingItem(
+            tenant_id=tenant.id,
+            call_id=call.id,
+            call_uuid=call_uuid,
+            amount=None if rate is None or rate.unit_price is None else rate.unit_price,
+            currency="CNY",
+            rate_note="unquoted" if rate is None or rate.unit_price is None else rate.note,
+        )
+    )
