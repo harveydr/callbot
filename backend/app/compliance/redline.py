@@ -15,6 +15,10 @@ _RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("fake_authority", re.compile(r"我是(银行|公安|警察|法院|政府)")),
     ("loan_inducement", re.compile(r"无抵押秒批|保证下款|内部渠道放款")),
     ("abuse", re.compile(r"傻逼|滚开|神经病")),
+    (
+        "pii_disclosure",
+        re.compile(r"身份证号|身份证号码|银行卡号|银行卡完整号|完整卡号|(?<!\d)(?:\d[ -]?){15,18}\d(?!\d)"),
+    ),
 )
 _JUDGE_CUE = re.compile(r"承诺|收益|价格|费用|收费|疗效|通过率|我是|银行|公安|警察|法院|政府|身份|元|块")
 

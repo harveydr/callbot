@@ -446,6 +446,21 @@ async def test_a_promise_is_replaced_and_the_opening_is_put_back() -> None:
     assert outcome.reply_text.startswith("您好，我是回声的人工智能语音助理。")
 
 
+async def test_an_identity_number_is_not_spoken() -> None:
+    outcome = await run_session(
+        [Frame("caller", "PCM:请问一下".encode("utf-8"))],
+        company="回声",
+        purpose="通知",
+        llm_mode="pii",
+        script=_priced_script("请把身份证号 110101199001011234 发我。"),
+    )
+    assert outcome.redline_hits == ["pii_disclosure"]
+    assert "110101199001011234" not in outcome.reply_text
+    assert "身份证号" not in outcome.reply_text
+    assert "这个问题我记下来" in outcome.reply_text
+    assert opening_is_complete(outcome.reply_text)
+
+
 async def test_a_refusal_is_not_followed_by_another_pitch() -> None:
     kept = "您再考虑一下。这是最后一次优惠。"
     refused = await run_session(

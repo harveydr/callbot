@@ -424,3 +424,13 @@ def test_a_negated_promise_stays_until_the_second_pass() -> None:
     assert "疗效很好" in slow.text
     assert on_time.timed_out is False
     assert on_time.action == "rewrite"
+    assert scan_redline("请把身份证号告诉我") == ["pii_disclosure"]
+    assert scan_redline("卡号 6222021234567890123") == ["pii_disclosure"]
+    assert scan_redline("请拨 13800007001") == []
+    assert scan_redline("没有身份证号") == []
+    hidden = guard_model_output("请把身份证号 110101199001011234 发我。", prior_hits=0)
+    assert hidden[1] == ["pii_disclosure"]
+    assert "110101199001011234" not in hidden[0]
+    both = guard_model_output("我们保证收益，请报身份证号。", prior_hits=0)
+    assert both[1] == ["promise_return", "pii_disclosure"]
+    assert both[2] == "hangup"

@@ -49,6 +49,7 @@ async def main() -> None:
             ("fake_authority", "我是(银行|公安|警察|法院|政府)"),
             ("loan_inducement", "无抵押秒批|保证下款|内部渠道放款"),
             ("abuse", "傻逼|滚开|神经病"),
+            ("pii_disclosure", "身份证号|身份证号码|银行卡号|银行卡完整号|完整卡号"),
         ):
             exists = await session.scalar(select(RedlineRule).where(RedlineRule.code == code, RedlineRule.tenant_id.is_(None)))
             if exists is None:
