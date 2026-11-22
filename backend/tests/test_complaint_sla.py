@@ -11,7 +11,7 @@ from app.compliance.complaint_sla import flag_overdue_complaints, resolve_due, r
 from app.config import load_settings
 from app.db import set_bypass
 from app.errors import ApiError
-from app.models import Tenant, User
+from app.models import DndEntry, PlatformDnd, Tenant, User
 from app.models.extra import Alert, Complaint
 from app.security.passwords import hash_password
 from app.services.control import open_complaint, progress_complaint
@@ -98,6 +98,45 @@ async def test_opening_a_complaint_stores_both_deadlines(
         assert row.disposition == "已停呼并致歉"
         assert closed["status"] == "closed"
         assert closed["version"] == 1
+        cooled = await session.scalar(select(PlatformDnd).where(PlatformDnd.phone_hash == row.phone_hash))
+        assert cooled is not None and cooled.expires_at == row.created_at + timedelta(days=30)
+        assert cooled.source == "complaint"
+
+
+async def test_a_tenant_can_keep_the_block_local(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    settings = load_settings()
+    async with session_factory() as session:
+        await set_bypass(session)
+        tenant = await _tenant(session, "sla-local")
+        tenant.compliance_config = {"dnd": {"enforce_platform_global": False}}
+        user = User(
+            tenant_id=tenant.id,
+            username="sla-local-admin",
+            password_hash=hash_password("password12"),
+            display_name="admin",
+            role="tenant_admin",
+            must_change_password=False,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(user)
+        await session.flush()
+        await open_complaint(
+            session,
+            tenant_id=tenant.id,
+            phone="13800007004",
+            detail="只禁本租户",
+            settings=settings,
+            user_id=user.id,
+            trace_id="trace",
+            call_id=None,
+        )
+        platform = await session.scalar(select(PlatformDnd.id))
+        local = await session.scalar(select(DndEntry.id).where(DndEntry.tenant_id == tenant.id))
+        assert platform is None
+        assert local is not None
 
 
 async def test_overdue_complaints_are_flagged_once(

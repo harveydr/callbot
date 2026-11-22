@@ -17,8 +17,14 @@ import redis.asyncio as redis_async
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.compliance.cache import remember_dnd
-from app.compliance.complaint_sla import complaint_clock, respond_due, resolve_due
+from app.compliance.cache import remember_dnd, remember_platform
+from app.compliance.complaint_sla import (
+    apply_platform_cooldown,
+    complaint_clock,
+    platform_cooldown_enabled,
+    respond_due,
+    resolve_due,
+)
 from app.config import Settings
 from app.db import set_bypass, set_tenant
 from app.errors import ApiError
@@ -677,10 +683,18 @@ async def open_complaint(
                 permanent=True,
             )
         )
+    owner = await session.get(Tenant, tenant_id)
+    if owner is not None and platform_cooldown_enabled(owner.compliance_config):
+        await set_bypass(session)
+        await apply_platform_cooldown(
+            session, phone_hash=hashed, phone_last4=normalized[-4:], now=created
+        )
     await _block_caller_if_complaint_rate(session, tenant_id=tenant_id, call_id=call_id)
     await session.flush()
+    await set_tenant(session, tenant_id)
     if redis is not None:
         await remember_dnd(redis, tenant_id=tenant_id, phone_hash=hashed)
+        await remember_platform(redis, phone_hash=hashed)
     await audit(session, tenant_id=tenant_id, user_id=user_id, action="complaint.create", target_type="complaint", target_id=str(complaint.id), detail={"phone": mask_phone(normalized)}, trace_id=trace_id)
     payload = complaint_clock(complaint)
     payload["phone_last4"] = complaint.phone_last4

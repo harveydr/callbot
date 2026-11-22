@@ -385,6 +385,7 @@ class PlatformDnd(Base):
     phone_hash: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     phone_last4: Mapped[str] = mapped_column(Text, nullable=False)
     source: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = _ts()
 
 

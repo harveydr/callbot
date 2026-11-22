@@ -168,8 +168,8 @@ async def pre_dial_gate(
         return block("COMPLIANCE_SCENARIO_NOT_ALLOWED", "trunk_scenario_mismatch")
 
     if redis is None:
-        platform_hit = await session.scalar(select(PlatformDnd.id).where(PlatformDnd.phone_hash == phone_hash).limit(1))
-        if platform_hit is not None:
+        platform_row = await session.scalar(select(PlatformDnd).where(PlatformDnd.phone_hash == phone_hash).limit(1))
+        if platform_row is not None and (platform_row.expires_at is None or platform_row.expires_at > now):
             return block("COMPLIANCE_DND_HIT", "platform_dnd")
         tenant_hit = await session.scalar(
             select(DndEntry.id)
@@ -189,7 +189,7 @@ async def pre_dial_gate(
         if consent is None or consent.consented_at > now or (consent.expires_at is not None and consent.expires_at <= now):
             return block("COMPLIANCE_NO_CONSENT", "no_valid_consent")
     else:
-        reason = await dnd_reason(session, redis, tenant_id=tenant.id, phone_hash=phone_hash)
+        reason = await dnd_reason(session, redis, tenant_id=tenant.id, phone_hash=phone_hash, now=now)
         if reason is not None:
             return block("COMPLIANCE_DND_HIT", reason)
         if not await consent_allows(

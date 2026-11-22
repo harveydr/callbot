@@ -8,8 +8,10 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Tenant
+from app.models import PlatformDnd, Tenant
 from app.models.extra import Alert, Complaint
+
+_COOLDOWN = timedelta(days=30)
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -70,6 +72,42 @@ async def _once(session: AsyncSession, row: Complaint, *, code: str, severity: s
         return 0
     session.add(Alert(tenant_id=row.tenant_id, severity=severity, code=code, message=message))
     return 1
+
+
+def platform_cooldown_enabled(config: object) -> bool:
+    """Cross-tenant cooling stays on unless the platform explicitly turns that one switch off."""
+    if not isinstance(config, dict):
+        return True
+    dnd = config.get("dnd")
+    if isinstance(dnd, dict) and dnd.get("enforce_platform_global") is False:
+        return False
+    return True
+
+
+async def apply_platform_cooldown(
+    session: AsyncSession,
+    *,
+    phone_hash: str,
+    phone_last4: str,
+    now: datetime,
+) -> None:
+    """Block the number for every tenant for 30 days. A permanent entry stays permanent."""
+    moment = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    until = moment + _COOLDOWN
+    row = await session.scalar(select(PlatformDnd).where(PlatformDnd.phone_hash == phone_hash))
+    if row is None:
+        session.add(
+            PlatformDnd(
+                phone_hash=phone_hash,
+                phone_last4=phone_last4,
+                source="complaint",
+                expires_at=until,
+                created_at=moment,
+            )
+        )
+        return
+    if row.expires_at is not None and row.expires_at < until:
+        row.expires_at = until
 
 
 def complaint_clock(row: Complaint) -> dict[str, object]:

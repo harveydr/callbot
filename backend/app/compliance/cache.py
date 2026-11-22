@@ -12,7 +12,7 @@ import json
 import random
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, cast
 
 from redis.exceptions import RedisError
@@ -137,13 +137,20 @@ async def _hydrate(
         await client.delete(_lock_key(scope))
 
 
-async def _point_dnd(session: AsyncSession, *, tenant_id: uuid.UUID | None, phone_hash: str) -> bool:
+def _platform_active(expires_at: datetime | None, now: datetime) -> bool:
+    moment = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    return expires_at is None or expires_at > moment
+
+
+async def _point_dnd(
+    session: AsyncSession, *, tenant_id: uuid.UUID | None, phone_hash: str, now: datetime
+) -> bool:
     if tenant_id is None:
-        found = await session.scalar(select(PlatformDnd.id).where(PlatformDnd.phone_hash == phone_hash).limit(1))
-    else:
-        found = await session.scalar(
-            select(DndEntry.id).where(DndEntry.tenant_id == tenant_id, DndEntry.phone_hash == phone_hash).limit(1)
-        )
+        row = await session.scalar(select(PlatformDnd).where(PlatformDnd.phone_hash == phone_hash).limit(1))
+        return row is not None and _platform_active(row.expires_at, now)
+    found = await session.scalar(
+        select(DndEntry.id).where(DndEntry.tenant_id == tenant_id, DndEntry.phone_hash == phone_hash).limit(1)
+    )
     return found is not None
 
 
@@ -154,6 +161,7 @@ async def _scope_hit(
     scope: str,
     tenant_id: uuid.UUID | None,
     phone_hash: str,
+    now: datetime,
     load_all: Callable[[], Awaitable[list[str]]],
 ) -> bool:
     ready = await _answer_if_ready(client, scope, phone_hash)
@@ -164,7 +172,7 @@ async def _scope_hit(
     hydrated = await _hydrate(client, scope, phone_hash, load_all)
     if hydrated is not None:
         return hydrated
-    hit = await _point_dnd(session, tenant_id=tenant_id, phone_hash=phone_hash)
+    hit = await _point_dnd(session, tenant_id=tenant_id, phone_hash=phone_hash, now=now)
     if hit:
         await _remember(client, scope, phone_hash)
     else:
@@ -178,6 +186,7 @@ async def dnd_reason(
     *,
     tenant_id: uuid.UUID,
     phone_hash: str,
+    now: datetime,
 ) -> str | None:
     """Return platform_dnd, tenant_dnd, or None. Redis failure reads Postgres."""
     try:
@@ -187,8 +196,12 @@ async def dnd_reason(
             scope="platform",
             tenant_id=None,
             phone_hash=phone_hash,
-            load_all=lambda: _load_platform(session),
+            now=now,
+            load_all=lambda: _load_platform(session, now),
         )
+        if platform and not await _point_dnd(session, tenant_id=None, phone_hash=phone_hash, now=now):
+            await client.srem(_set_key("platform"), phone_hash)
+            platform = False
         if platform:
             return "platform_dnd"
         tenant_hit = await _scope_hit(
@@ -197,12 +210,13 @@ async def dnd_reason(
             scope=_scope_tenant(tenant_id),
             tenant_id=tenant_id,
             phone_hash=phone_hash,
+            now=now,
             load_all=lambda: _load_tenant(session, tenant_id),
         )
     except RedisError:
-        if await _point_dnd(session, tenant_id=None, phone_hash=phone_hash):
+        if await _point_dnd(session, tenant_id=None, phone_hash=phone_hash, now=now):
             return "platform_dnd"
-        if await _point_dnd(session, tenant_id=tenant_id, phone_hash=phone_hash):
+        if await _point_dnd(session, tenant_id=tenant_id, phone_hash=phone_hash, now=now):
             return "tenant_dnd"
         return None
     if tenant_hit:
@@ -210,14 +224,21 @@ async def dnd_reason(
     return None
 
 
-async def _load_platform(session: AsyncSession) -> list[str]:
-    rows = (await session.scalars(select(PlatformDnd.phone_hash))).all()
-    return [row for row in rows if isinstance(row, str)]
+async def _load_platform(session: AsyncSession, now: datetime) -> list[str]:
+    rows = (await session.scalars(select(PlatformDnd))).all()
+    return [row.phone_hash for row in rows if _platform_active(row.expires_at, now)]
 
 
 async def _load_tenant(session: AsyncSession, tenant_id: uuid.UUID) -> list[str]:
     rows = (await session.scalars(select(DndEntry.phone_hash).where(DndEntry.tenant_id == tenant_id))).all()
     return [row for row in rows if isinstance(row, str)]
+
+
+async def remember_platform(client: Any, *, phone_hash: str) -> None:
+    try:
+        await _remember(client, "platform", phone_hash)
+    except RedisError:
+        return
 
 
 async def remember_dnd(client: Any, *, tenant_id: uuid.UUID, phone_hash: str) -> None:

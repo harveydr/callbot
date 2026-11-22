@@ -260,6 +260,49 @@ async def test_dnd_and_platform_dnd_block(session_factory) -> None:
     assert decision.block_reason == "platform_dnd"
 
 
+async def test_an_expired_platform_cooldown_does_not_block(session_factory, redis_client) -> None:
+    ids = await _world(session_factory)
+    await _consent(session_factory, ids)
+    tenant, trunk, campaign = _views(ids)
+    cooled = phone_hash("13900003333", PEPPER)
+    async with session_factory() as session:
+        await set_bypass(session)
+        session.add(
+            PlatformDnd(
+                phone_hash=cooled,
+                phone_last4="3333",
+                source="complaint",
+                expires_at=NOW + timedelta(days=30),
+                created_at=NOW,
+            )
+        )
+        await session.commit()
+    async with session_factory() as session:
+        await set_tenant(session, ids["tenant_id"])
+        live = await pre_dial_gate(
+            session,
+            tenant=tenant,
+            trunk=trunk,
+            campaign=campaign,
+            phone_hash=cooled,
+            now=NOW,
+            flags=_flags(),
+            redis=redis_client,
+        )
+        later = await pre_dial_gate(
+            session,
+            tenant=tenant,
+            trunk=trunk,
+            campaign=campaign,
+            phone_hash=cooled,
+            now=NOW + timedelta(days=31),
+            flags=_flags(),
+            redis=redis_client,
+        )
+    assert live.block_reason == "platform_dnd"
+    assert later.block_reason == "no_valid_consent"
+
+
 async def test_outside_window_and_lunch_are_blocked(session_factory) -> None:
     ids = await _world(session_factory)
     await _consent(session_factory, ids)
