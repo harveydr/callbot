@@ -186,6 +186,7 @@ class ComplaintPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     version: int
     status: str
+    disposition: str | None = None
 
 
 class ConfirmBody(BaseModel):

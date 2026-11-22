@@ -18,6 +18,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.compliance.cache import remember_dnd
+from app.compliance.complaint_sla import complaint_clock, respond_due, resolve_due
 from app.config import Settings
 from app.db import set_bypass, set_tenant
 from app.errors import ApiError
@@ -651,6 +652,7 @@ async def open_complaint(
     except PhoneInvalidError as exc:
         raise ApiError(422, "VALIDATION", "phone_invalid") from exc
     hashed = phone_hash(normalized, settings.phone_pepper)
+    created = datetime.now(timezone.utc)
     complaint = Complaint(
         tenant_id=tenant_id,
         call_id=call_id,
@@ -658,6 +660,9 @@ async def open_complaint(
         phone_last4=normalized[-4:],
         detail=detail,
         status="open",
+        created_at=created,
+        respond_due_at=respond_due(created),
+        resolve_due_at=resolve_due(created),
     )
     session.add(complaint)
     exists = await session.scalar(select(DndEntry).where(DndEntry.tenant_id == tenant_id, DndEntry.phone_hash == hashed))
@@ -677,7 +682,31 @@ async def open_complaint(
     if redis is not None:
         await remember_dnd(redis, tenant_id=tenant_id, phone_hash=hashed)
     await audit(session, tenant_id=tenant_id, user_id=user_id, action="complaint.create", target_type="complaint", target_id=str(complaint.id), detail={"phone": mask_phone(normalized)}, trace_id=trace_id)
-    return {"id": str(complaint.id), "phone_last4": complaint.phone_last4, "status": complaint.status, "dnd": True}
+    payload = complaint_clock(complaint)
+    payload["phone_last4"] = complaint.phone_last4
+    payload["dnd"] = True
+    return payload
+
+
+def progress_complaint(row: Complaint, *, status: str, disposition: str | None, now: datetime) -> dict[str, object]:
+    """Record the first response, and require a written result before the ticket can close."""
+    if status not in {"open", "processing", "closed"}:
+        raise ApiError(422, "VALIDATION", "status is invalid")
+    moment = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    cleaned = disposition.strip() if isinstance(disposition, str) else ""
+    if status == "closed" and not cleaned:
+        raise ApiError(422, "VALIDATION", "disposition is required")
+    if row.status == "open" and status != "open" and row.responded_at is None:
+        row.responded_at = moment
+    if status == "closed":
+        row.resolved_at = moment
+        row.disposition = cleaned
+    else:
+        row.resolved_at = None
+        row.disposition = None
+    row.status = status
+    row.version += 1
+    return complaint_clock(row)
 
 
 async def build_evidence(

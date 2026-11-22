@@ -188,6 +188,11 @@ class Complaint(Base):
     detail: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'open'"))
     created_at: Mapped[datetime] = _ts()
+    respond_due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    resolve_due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    responded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    disposition: Mapped[str | None] = mapped_column(Text)
     version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
 
 

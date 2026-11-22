@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import secrets
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import Depends, File, Header, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
@@ -52,6 +53,7 @@ from app.services.control import (
     job_payload,
     load_turns,
     open_complaint,
+    progress_complaint,
     overview,
     owned,
     paging,
@@ -868,11 +870,13 @@ async def patch_complaint(
     row = await owned(session, Complaint, complaint_id, require_tenant(principal))
     if row.version != body.version:
         raise ApiError(409, "VERSION_CONFLICT", "已被他人修改，请刷新")
-    if body.status not in {"open", "processing", "closed"}:
-        raise ApiError(422, "VALIDATION", "status is invalid")
-    row.status = body.status
-    row.version += 1
-    return envelope(request.state.trace_id, {"id": str(row.id), "status": row.status, "version": row.version})
+    data = progress_complaint(
+        row,
+        status=body.status,
+        disposition=body.disposition,
+        now=datetime.now(timezone.utc),
+    )
+    return envelope(request.state.trace_id, data)
 
 
 @tenant_router.post("/audit/evidence-pack")

@@ -40,6 +40,10 @@ celery_app.conf.update(
             "task": "purge_closed_tenants",
             "schedule": crontab(hour=0, minute=30),
         },
+        "flag-complaint-sla": {
+            "task": "flag_complaint_sla",
+            "schedule": crontab(minute=15),
+        },
     },
     task_routes={
         "dispatch_campaign": {"queue": "dispatch"},
@@ -51,6 +55,7 @@ celery_app.conf.update(
         "sweep_qualifications": {"queue": "dispatch"},
         "ensure_audit_partitions": {"queue": "dispatch"},
         "purge_closed_tenants": {"queue": "dispatch"},
+        "flag_complaint_sla": {"queue": "dispatch"},
     },
     task_annotations={
         "dispatch_campaign": {"time_limit": 60},
@@ -58,6 +63,7 @@ celery_app.conf.update(
         "sweep_qualifications": {"time_limit": 60},
         "ensure_audit_partitions": {"time_limit": 60},
         "purge_closed_tenants": {"time_limit": 60},
+        "flag_complaint_sla": {"time_limit": 60},
         "import_contacts": {"time_limit": 600},
         "billing_reconcile": {"time_limit": 120},
         "probe_missing_cdr": {"time_limit": 120},
@@ -79,6 +85,7 @@ def durable_task(*args: object, **kwargs: object):
 app = celery_app
 
 from app.tasks import billing_schedule as billing_schedule_task  # noqa: E402,F401
+from app.tasks import complaints as complaint_task  # noqa: E402,F401
 from app.tasks import dispatch as dispatch_task  # noqa: E402,F401
 from app.tasks import erasure as erasure_task  # noqa: E402,F401
 from app.tasks import imports as import_task  # noqa: E402,F401

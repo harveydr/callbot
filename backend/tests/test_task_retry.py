@@ -14,6 +14,7 @@ _NAMES = (
     "sweep_qualifications",
     "ensure_audit_partitions",
     "purge_closed_tenants",
+    "flag_complaint_sla",
 )
 
 
