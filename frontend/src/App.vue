@@ -1,84 +1,98 @@
 <template>
-  <el-container style="min-height: 100vh">
-    <el-header v-if="session.accessToken" height="56px" style="display: flex; align-items: center; gap: 16px">
-      <strong>EchoDesk</strong>
-      <el-menu mode="horizontal" :router="true" :ellipsis="false" style="flex: 1; border-bottom: none">
-        <el-menu-item v-for="item in links" :key="item.to" :index="item.to">{{ item.label }}</el-menu-item>
-      </el-menu>
-      <span>{{ session.role }}</span>
-      <el-button link @click="logout">退出</el-button>
-    </el-header>
-    <el-main>
-      <el-alert
-        v-if="degraded"
-        title="服务降级：全局外呼已暂停。进行中的合规拦截仍然生效，新的外呼不会发起。"
-        type="warning"
-        show-icon
-        :closable="false"
-        style="margin-bottom: 12px"
-      />
-      <el-alert
-        v-else-if="voiceMode === '语音合成暂停'"
-        title="语音合成不可用，新的外呼已暂停，系统会稍后回拨。"
-        type="error"
-        show-icon
-        :closable="false"
-        style="margin-bottom: 12px"
-      />
-      <el-alert
-        v-else-if="voiceMode === '话术树模式'"
-        title="话术树模式：我用标准流程为您解答。"
-        type="warning"
-        show-icon
-        :closable="false"
-        style="margin-bottom: 12px"
-      />
-      <router-view />
-    </el-main>
+  <router-view v-if="!session.accessToken" />
+  <el-container v-else class="shell">
+    <el-aside :width="collapsed ? '64px' : '220px'" class="sidebar">
+      <div class="brand" @click="collapsed = !collapsed">
+        <strong v-if="!collapsed">EchoDesk</strong>
+        <span v-else>ED</span>
+      </div>
+      <el-scrollbar class="menu-scroll">
+        <el-menu
+          :default-active="route.path"
+          :collapse="collapsed"
+          :router="true"
+          background-color="var(--ed-sidebar-bg)"
+          text-color="var(--ed-sidebar-text)"
+          active-text-color="#ffffff"
+        >
+          <template v-for="group in groups" :key="group.title">
+            <div v-if="!collapsed" class="group-title">{{ group.title }}</div>
+            <el-menu-item v-for="item in group.items" :key="item.to" :index="item.to">
+              {{ item.label }}
+            </el-menu-item>
+          </template>
+        </el-menu>
+      </el-scrollbar>
+    </el-aside>
+    <el-container>
+      <el-header class="topbar">
+        <el-breadcrumb separator="/">
+          <el-breadcrumb-item :to="session.homePath()">首页</el-breadcrumb-item>
+          <el-breadcrumb-item v-if="currentTitle">{{ currentTitle }}</el-breadcrumb-item>
+        </el-breadcrumb>
+        <div class="topbar-right">
+          <span v-if="session.tenantId" class="ed-muted">租户 {{ session.tenantId }}</span>
+          <span>{{ roleLabel(session.role) }} · {{ session.username || "未命名用户" }}</span>
+          <el-button link type="danger" @click="logout">退出</el-button>
+        </div>
+      </el-header>
+      <el-main class="ed-page">
+        <el-alert
+          v-if="degraded"
+          title="服务降级：全局外呼已暂停。合规拦截仍生效，新外呼不会发起。"
+          type="warning"
+          show-icon
+          :closable="false"
+          style="margin-bottom: 12px"
+        />
+        <el-alert
+          v-else-if="voiceMode === '语音合成暂停'"
+          title="语音合成不可用，新外呼已暂停，系统会稍后回拨。"
+          type="error"
+          show-icon
+          :closable="false"
+          style="margin-bottom: 12px"
+        />
+        <el-alert
+          v-else-if="voiceMode === '话术树模式'"
+          title="话术树模式：按标准流程应答，大模型自由话术已降级。"
+          type="warning"
+          show-icon
+          :closable="false"
+          style="margin-bottom: 12px"
+        />
+        <router-view />
+      </el-main>
+    </el-container>
   </el-container>
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from "vue";
-import { useRouter } from "vue-router";
+import { computed, onMounted, ref, watch } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import { api } from "./api/client";
 import { useSession } from "./stores/session";
+import { navGroups, roleLabel, routeTitles } from "./utils/navigation";
 
 const session = useSession();
 const router = useRouter();
+const route = useRoute();
+const collapsed = ref(false);
 const degraded = ref(false);
 const voiceMode = ref("正常");
 session.hydrate();
 
-const links = computed(() => {
-  if (session.role === "platform_admin") {
-    return [
-      { to: "/p/tenants", label: "租户" },
-      { to: "/p/trunks", label: "熔断" },
-      { to: "/p/policies", label: "告警" },
-      { to: "/p/billing", label: "指标" },
-    ];
-  }
-  const items = [
-    { to: "/t/dashboard", label: "控制台" },
-    { to: "/t/campaigns", label: "任务" },
-    { to: "/t/lists", label: "名单" },
-    { to: "/t/templates", label: "话术" },
-    { to: "/t/live", label: "实时" },
-  ];
-  if (session.role === "tenant_admin") {
-    items.push(
-      { to: "/t/reports", label: "报表" },
-      { to: "/t/billing", label: "账单" },
-      { to: "/t/members", label: "成员" },
-    );
-  }
-  if (session.role === "auditor" || session.role === "tenant_admin") {
-    items.push({ to: "/t/audit/complaints", label: "合规" });
-  }
-  if (session.role === "agent") items.push({ to: "/agent/queue", label: "我的来电" });
-  return items;
-});
+const groups = computed(() => navGroups(session.role));
+const currentTitle = computed(() => route.meta.title || routeTitles[route.path] || "");
+
+watch(
+  () => route.fullPath,
+  () => {
+    const title = currentTitle.value;
+    document.title = title ? `${title} · EchoDesk` : "EchoDesk";
+  },
+  { immediate: true },
+);
 
 onMounted(async () => {
   if (!session.accessToken || session.role === "platform_admin") return;
@@ -92,8 +106,53 @@ onMounted(async () => {
   }
 });
 
-function logout() {
+async function logout() {
+  try {
+    if (session.accessToken) await api.post("/api/auth/logout");
+  } catch {
+    /* ignore */
+  }
   session.clear();
   router.push("/login");
 }
 </script>
+
+<style scoped>
+.shell {
+  min-height: 100vh;
+}
+.sidebar {
+  background: var(--ed-sidebar-bg);
+  color: #fff;
+  transition: width 0.2s ease;
+}
+.brand {
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  border-bottom: 1px solid rgb(255 255 255 / 8%);
+}
+.menu-scroll {
+  height: calc(100vh - 56px);
+}
+.group-title {
+  padding: 12px 20px 4px;
+  font-size: 12px;
+  color: #94a3b8;
+}
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--ed-header-bg);
+  border-bottom: 1px solid #ebeef5;
+}
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+}
+</style>
