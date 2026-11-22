@@ -531,7 +531,7 @@ async def start_campaign(
         return {"campaign_id": str(campaign.id), "task_count": existing, "idempotent": True, "started": 0}
     campaign.status = "running"
     campaign.created_by = campaign.created_by or user_id
-    created = await ensure_initial_tasks(session, campaign)
+    created = await ensure_initial_tasks(session, campaign, now=moment)
     started = 0
     if place_calls:
         started = await dial_pending(

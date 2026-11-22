@@ -1,17 +1,32 @@
 <template>
   <div>
-    <h1>控制台</h1>
+    <PageHeader title="控制台" description="租户运营概览（基于报表 overview 接口）。" />
     <StateView :status="status" :message="message" @retry="load">
-      <el-row :gutter="12">
-        <el-col :span="8"><el-statistic title="呼叫" :value="data.calls || 0" /></el-col>
-        <el-col :span="8"><el-statistic title="完成" :value="data.completed || 0" /></el-col>
-        <el-col :span="8"><el-statistic title="合规拦截" :value="data.blocked_compliance || 0" /></el-col>
-      </el-row>
-      <el-row :gutter="12" style="margin-top: 16px">
-        <el-col :span="8"><p class="metric"><span>接通率</span><strong>{{ percent(data.answer_rate) }}</strong></p></el-col>
-        <el-col :span="8"><p class="metric"><span>拒接率</span><strong>{{ percent(data.reject_rate) }}</strong></p></el-col>
-        <el-col :span="8"><p class="metric"><span>AI 独立完成率</span><strong>{{ percent(data.ai_complete_rate) }}</strong></p></el-col>
-      </el-row>
+      <div class="ed-metric-grid">
+        <div v-for="m in primaryMetrics" :key="m.key" class="ed-metric">
+          <span>{{ m.label }}</span>
+          <strong>{{ format(m.key, data[m.key]) }}</strong>
+        </div>
+      </div>
+      <h3 style="margin-top: 20px">接通与意向</h3>
+      <div class="ed-metric-grid">
+        <div v-for="m in intentMetrics" :key="m.key" class="ed-metric">
+          <span>{{ m.label }}</span>
+          <strong>{{ format(m.key, data[m.key]) }}</strong>
+        </div>
+      </div>
+      <h3 style="margin-top: 20px">合规拦截</h3>
+      <div class="ed-metric-grid">
+        <div class="ed-metric"><span>无授权拦截</span><strong>{{ data.no_consent_blocks ?? 0 }}</strong></div>
+        <div class="ed-metric"><span>DND 拦截</span><strong>{{ data.dnd_blocks ?? 0 }}</strong></div>
+        <div class="ed-metric"><span>命中最高规则</span><strong>{{ data.top_compliance_rule || "—" }}</strong></div>
+      </div>
+      <el-alert
+        type="info"
+        :closable="false"
+        title="并发水位与异常任务榜：后端 overview 未提供对应字段，本版不展示。"
+        style="margin-top: 16px"
+      />
     </StateView>
   </div>
 </template>
@@ -19,15 +34,36 @@
 <script setup>
 import { ref } from "vue";
 import StateView from "../components/StateView.vue";
+import PageHeader from "../components/PageHeader.vue";
 import { api } from "../api/client";
 
 const status = ref("loading");
 const message = ref("");
 const data = ref({});
 
-function percent(rate) {
-  if (rate === null || rate === undefined || rate === "") return "—";
-  return `${(Number(rate) * 100).toFixed(1)}%`;
+const primaryMetrics = [
+  { key: "calls", label: "总呼叫" },
+  { key: "completed", label: "完成" },
+  { key: "blocked_compliance", label: "合规拦截" },
+  { key: "answer_rate", label: "接通率" },
+  { key: "reject_rate", label: "拒接率" },
+  { key: "ai_complete_rate", label: "AI 独立完成率" },
+  { key: "transfer_rate", label: "转人工率" },
+  { key: "avg_duration_sec", label: "平均时长(秒)" },
+];
+
+const intentMetrics = [
+  { key: "intent_a", label: "意向 A" },
+  { key: "intent_b", label: "意向 B" },
+  { key: "intent_c", label: "意向 C" },
+  { key: "intent_d", label: "意向 D" },
+  { key: "intent_na", label: "意向 NA" },
+];
+
+function format(key, value) {
+  if (value === null || value === undefined || value === "") return "—";
+  if (key.endsWith("_rate")) return `${(Number(value) * 100).toFixed(1)}%`;
+  return value;
 }
 
 async function load() {
@@ -44,19 +80,3 @@ async function load() {
 
 load();
 </script>
-
-<style scoped>
-.metric {
-  margin: 0;
-  padding: 12px 0;
-}
-.metric span {
-  display: block;
-  color: #909399;
-  font-size: 12px;
-}
-.metric strong {
-  font-size: 24px;
-  font-weight: 500;
-}
-</style>

@@ -1,0 +1,69 @@
+:root {
+  --ed-primary: #2563eb;
+  --ed-bg: #f5f7fa;
+  --ed-sidebar-bg: #0f172a;
+  --ed-sidebar-text: #cbd5e1;
+  --ed-sidebar-active: #2563eb;
+  --ed-header-bg: #ffffff;
+  --ed-card-radius: 8px;
+  --ed-page-padding: 20px;
+  --el-color-primary: var(--ed-primary);
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--ed-bg);
+  font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+.ed-page {
+  padding: var(--ed-page-padding);
+  max-width: 1400px;
+}
+
+.ed-card {
+  background: #fff;
+  border-radius: var(--ed-card-radius);
+  padding: 16px;
+  margin-bottom: 16px;
+  box-shadow: 0 1px 2px rgb(15 23 42 / 6%);
+}
+
+.ed-muted {
+  color: #909399;
+  font-size: 13px;
+}
+
+.ed-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 12px;
+}
+
+.ed-metric {
+  border: 1px solid #ebeef5;
+  border-radius: 6px;
+  padding: 12px;
+}
+
+.ed-metric span {
+  display: block;
+  color: #909399;
+  font-size: 12px;
+}
+
+.ed-metric strong {
+  display: block;
+  margin-top: 6px;
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.ed-table-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}

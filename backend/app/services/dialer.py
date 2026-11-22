@@ -90,7 +90,7 @@ def _aware(now: datetime) -> datetime:
     return now.astimezone(timezone.utc)
 
 
-async def ensure_initial_tasks(session: AsyncSession, campaign: Campaign) -> int:
+async def ensure_initial_tasks(session: AsyncSession, campaign: Campaign, *, now: datetime | None = None) -> int:
     contacts = (
         await session.scalars(
             select(Contact).where(
@@ -100,6 +100,7 @@ async def ensure_initial_tasks(session: AsyncSession, campaign: Campaign) -> int
             )
         )
     ).all()
+    moment = _aware(now if now is not None else datetime.now(timezone.utc))
     created = 0
     for contact in contacts:
         exists = await session.scalar(
@@ -114,7 +115,7 @@ async def ensure_initial_tasks(session: AsyncSession, campaign: Campaign) -> int
                 contact_id=contact.id,
                 attempt_no=1,
                 status="pending",
-                next_run_at=_aware(datetime.now(timezone.utc)),
+                next_run_at=moment,
             )
         )
         created += 1
