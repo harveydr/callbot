@@ -27,6 +27,9 @@ services:
     env_file: ../.env
     environment:
       CELERY_ENQUEUE: "true"
+      RECORDINGS_DIR: /var/rec
+    volumes:
+      - rec:/var/rec
     depends_on:
       db:
         condition: service_healthy
@@ -40,6 +43,10 @@ services:
       dockerfile: backend/Dockerfile
     env_file: ../.env
     command: celery -A app.tasks worker -Q dispatch,io_heavy,billing,report -l info --prefetch-multiplier=1
+    environment:
+      RECORDINGS_DIR: /var/rec
+    volumes:
+      - rec:/var/rec
     depends_on: [redis, db]
     restart: unless-stopped
   beat:
@@ -71,3 +78,4 @@ secrets:
 
 volumes:
   pg: {}
+  rec: {}

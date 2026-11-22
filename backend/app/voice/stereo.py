@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import struct
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import cast
+
+from app.voice.object_store import ObjectStore, StoreError, configured_store, publish_local, recordings_root
 
 SAMPLE_RATE = 8000
 CALLER_SAMPLE = 1000
@@ -121,10 +122,16 @@ def read_labels(wav: bytes) -> dict[str, object]:
 
 
 def _root() -> Path:
-    return Path(os.environ.get("RECORDINGS_DIR", "tmp/recordings")).resolve()
+    return recordings_root()
 
 
-def write_recording(tenant_id: uuid.UUID, call_uuid: uuid.UUID, turns: list[dict[str, str]], meta: dict[str, object]) -> str:
+def write_recording(
+    tenant_id: uuid.UUID,
+    call_uuid: uuid.UUID,
+    turns: list[dict[str, str]],
+    meta: dict[str, object],
+    store: ObjectStore | None = None,
+) -> str:
     raw = meta.get("AIGC")
     if not isinstance(raw, dict) or raw.get("Label") != "1" or raw.get("ProduceID") != str(call_uuid):
         raise ValueError("recording requires the AIGC label for this call")
@@ -135,14 +142,29 @@ def write_recording(tenant_id: uuid.UUID, call_uuid: uuid.UUID, turns: list[dict
     temporary = path.with_suffix(".part")
     temporary.write_bytes(stereo_wav(turns, aigc=aigc, explicit_label=EXPLICIT_LABEL))
     temporary.replace(path)
-    return f"recordings/{tenant_id}/{call_uuid}.wav"
+    key = f"recordings/{tenant_id}/{call_uuid}.wav"
+    chosen = store if store is not None else configured_store()
+    if chosen is not None:
+        publish_local(path, key, chosen)
+    return key
 
 
-def recording_payload(tenant_id: uuid.UUID, call_uuid: uuid.UUID) -> dict[str, object] | None:
+def recording_payload(
+    tenant_id: uuid.UUID, call_uuid: uuid.UUID, store: ObjectStore | None = None
+) -> dict[str, object] | None:
     path = (_root() / str(tenant_id) / f"{call_uuid}.wav").resolve()
-    if path.parent != (_root() / str(tenant_id)).resolve() or not path.is_file():
+    if path.parent != (_root() / str(tenant_id)).resolve():
         return None
-    raw = path.read_bytes()
+    if path.is_file():
+        raw = path.read_bytes()
+    else:
+        chosen = store if store is not None else configured_store()
+        if chosen is None:
+            return None
+        try:
+            raw = chosen.get(f"recordings/{tenant_id}/{call_uuid}.wav")
+        except StoreError:
+            return None
     labels = read_labels(raw)
     aigc = labels.get("AIGC")
     return {

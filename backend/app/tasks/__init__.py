@@ -44,6 +44,10 @@ celery_app.conf.update(
             "task": "flag_complaint_sla",
             "schedule": crontab(minute=15),
         },
+        "flush-recording-buffer": {
+            "task": "flush_recording_buffer",
+            "schedule": timedelta(minutes=1),
+        },
     },
     task_routes={
         "dispatch_campaign": {"queue": "dispatch"},
@@ -56,6 +60,7 @@ celery_app.conf.update(
         "ensure_audit_partitions": {"queue": "dispatch"},
         "purge_closed_tenants": {"queue": "dispatch"},
         "flag_complaint_sla": {"queue": "dispatch"},
+        "flush_recording_buffer": {"queue": "io_heavy"},
     },
     task_annotations={
         "dispatch_campaign": {"time_limit": 60},
@@ -64,6 +69,7 @@ celery_app.conf.update(
         "ensure_audit_partitions": {"time_limit": 60},
         "purge_closed_tenants": {"time_limit": 60},
         "flag_complaint_sla": {"time_limit": 60},
+        "flush_recording_buffer": {"time_limit": 120},
         "import_contacts": {"time_limit": 600},
         "billing_reconcile": {"time_limit": 120},
         "probe_missing_cdr": {"time_limit": 120},
@@ -91,4 +97,5 @@ from app.tasks import erasure as erasure_task  # noqa: E402,F401
 from app.tasks import imports as import_task  # noqa: E402,F401
 from app.tasks import partitions as partition_task  # noqa: E402,F401
 from app.tasks import qualification as qualification_task  # noqa: E402,F401
+from app.tasks import recordings as recording_task  # noqa: E402,F401
 from app.tasks import reports as report_task  # noqa: E402,F401

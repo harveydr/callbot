@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -14,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import AuditLog, Call, Campaign, ConsentRecord, Contact, Tenant
 from app.models.extra import Recording
 from app.services.control import audit
+from app.voice.object_store import ObjectStore, StoreError, configured_store, recordings_root
 
 _GRACE = timedelta(days=30)
 _KEY = re.compile(r"^recordings/([0-9a-fA-F-]{36})/([0-9a-fA-F-]{36})\.wav$")
@@ -36,7 +36,7 @@ def _recording_file(tenant_id: uuid.UUID, object_key: str) -> Path | None:
     matched = _KEY.fullmatch(object_key)
     if matched is None or matched.group(1) != str(tenant_id):
         return None
-    root = Path(os.environ.get("RECORDINGS_DIR", "tmp/recordings")).resolve()
+    root = recordings_root()
     path = (root / str(tenant_id) / f"{matched.group(2)}.wav").resolve()
     if path.parent != (root / str(tenant_id)).resolve():
         return None
@@ -65,9 +65,26 @@ async def close_tenant(session: AsyncSession, tenant: Tenant, *, user_id: uuid.U
     )
 
 
-async def purge_closed_tenants(session: AsyncSession, now: datetime) -> list[str]:
+def discard_recording_files(tenant_id: uuid.UUID, object_key: str, store: ObjectStore | None) -> bool:
+    """Delete the shared object first. A store error leaves the local file in place."""
+    path = _recording_file(tenant_id, object_key)
+    if store is not None and path is not None:
+        try:
+            store.delete(object_key)
+        except StoreError:
+            return False
+    if path is not None and path.is_file():
+        path.unlink()
+        marker = path.with_name(path.name + ".uploaded")
+        if marker.is_file():
+            marker.unlink()
+    return True
+
+
+async def purge_closed_tenants(session: AsyncSession, now: datetime, store: ObjectStore | None = None) -> list[str]:
     """Erase list data 30 days after close, once related recordings are past retention."""
     moment = _aware(now)
+    chosen = store if store is not None else configured_store()
     tenants = (await session.scalars(select(Tenant).where(Tenant.status == "closed"))).all()
     erased: list[str] = []
     for tenant in tenants:
@@ -76,12 +93,12 @@ async def purge_closed_tenants(session: AsyncSession, now: datetime) -> list[str
         )
         if closed_at is None or _aware(closed_at) + _GRACE > moment:
             continue
-        if await _purge_one(session, tenant, moment):
+        if await _purge_one(session, tenant, moment, chosen):
             erased.append(str(tenant.id))
     return erased
 
 
-async def _purge_one(session: AsyncSession, tenant: Tenant, now: datetime) -> bool:
+async def _purge_one(session: AsyncSession, tenant: Tenant, now: datetime, store: ObjectStore | None) -> bool:
     calls = (await session.scalars(select(Call).where(Call.tenant_id == tenant.id))).all()
     recordings = (await session.scalars(select(Recording).where(Recording.tenant_id == tenant.id))).all()
     retain_by_call = {row.call_id: row.retain_until for row in recordings}
@@ -117,9 +134,8 @@ async def _purge_one(session: AsyncSession, tenant: Tenant, now: datetime) -> bo
     for recording in recordings:
         if _aware(recording.retain_until) > now or recording.object_key.startswith("purged/"):
             continue
-        path = _recording_file(tenant.id, recording.object_key)
-        if path is not None and path.is_file():
-            path.unlink()
+        if not discard_recording_files(tenant.id, recording.object_key, store):
+            continue
         released.append(recording.object_key)
         recording.object_key = f"purged/{recording.object_key}"
     if wiped_contacts == 0 and wiped_consents == 0 and not released:

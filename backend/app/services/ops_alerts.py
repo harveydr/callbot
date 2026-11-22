@@ -16,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.extra import Alert
+from app.voice.object_store import recordings_root
 
 _HTTP = "ops:http_ms"
 _ASR = "ops:asr"
@@ -92,7 +93,7 @@ async def raise_ops_alerts(
 
 
 def disk_used_ratio() -> float | None:
-    path = Path(os.environ.get("RECORDINGS_DIR", "tmp/recordings")).resolve()
+    path = recordings_root()
     target = path if path.exists() else path.parent
     if not target.exists():
         target = Path("/")

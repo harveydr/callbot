@@ -15,6 +15,7 @@ _NAMES = (
     "ensure_audit_partitions",
     "purge_closed_tenants",
     "flag_complaint_sla",
+    "flush_recording_buffer",
 )
 
 
